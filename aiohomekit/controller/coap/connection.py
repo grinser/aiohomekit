@@ -79,6 +79,8 @@ COAP_ACCESSORY_IID = 1
 _WALK_EXPECTED_STATUSES = frozenset(
     {PDUStatus.INVALID_INSTANCE_ID, PDUStatus.INVALID_REQUEST, PDUStatus.UNSUPPORTED_PDU}
 )
+# Reads only far enough to capture the Accessory Information service.
+MINIMAL_ENUM_MAX_IID = 12
 # Both UUID forms: 0x09 reports the short one, signatures the full one.
 _ACCESSORY_INFORMATION_SERVICE = frozenset({0x3E, uuid.UUID("0000003E-0000-1000-8000-0026BB765291").int})
 # 0x09 reports base-range types in short form and lookups are written against
@@ -302,6 +304,9 @@ class CoAPHomeKitConnection:
         self._gatt_unsupported = False
         # Serialises enumeration against reconnects; see reconnect_soon().
         self._enumeration_lock = asyncio.Lock()
+        # Set when a bounded walk described only part of the accessory. Never set
+        # when 0x09 answered, which returns the whole database regardless.
+        self.database_is_partial = False
 
     async def reconnect_soon(self):
         if not self.enc_ctx:
@@ -440,7 +445,7 @@ class CoAPHomeKitConnection:
 
         return True
 
-    async def connect(self, pairing_data):
+    async def connect(self, pairing_data, max_iid: int = SIGNATURE_WALK_MAX_IID):
         async with self.connection_lock:
             if self.is_connected:
                 logger.debug("Already connected")
@@ -456,7 +461,7 @@ class CoAPHomeKitConnection:
                 raise AccessoryDisconnectedError("Pair verify failed")
 
             # we need the info this provides to be able to read/write characteristics
-            await self.get_accessory_info()
+            await self.get_accessory_info(max_iid)
 
             return
 
@@ -464,15 +469,18 @@ class CoAPHomeKitConnection:
     def is_connected(self):
         return self.enc_ctx is not None and self.enc_ctx.coap_ctx is not None
 
-    async def _signature_walk(self) -> dict[int, bytes]:
+    async def _signature_walk(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> dict[int, bytes]:
         """Enumerate the accessory database by reading each characteristic's
         signature (0x01), used when 0x09 is unavailable. Invalid iids come back
         fast as a PDUStatus, so probing a contiguous range is cheap; stop after a
         long run of gaps.
+
+        `max_iid` bounds the scan. The default covers a whole database; a small
+        value is used to read just the Accessory Information service quickly.
         """
         signatures: dict[int, bytes] = {}
         misses = 0
-        for iid in range(1, SIGNATURE_WALK_MAX_IID):
+        for iid in range(1, max_iid):
             result = await self.enc_ctx.post(
                 OpCode.CHAR_SIG_READ,
                 iid,
@@ -498,7 +506,7 @@ class CoAPHomeKitConnection:
             # characteristics above the scan limit that we are about to drop.
             logger.warning(
                 "Signature walk reached the iid scan limit (%d); the accessory database may be incomplete",
-                SIGNATURE_WALK_MAX_IID,
+                max_iid,
             )
         return signatures
 
@@ -598,7 +606,7 @@ class CoAPHomeKitConnection:
             aid += 1
         return Pdu09Database(_accessories=containers)
 
-    async def _read_gatt_database(self) -> Pdu09Database:
+    async def _read_gatt_database(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> Pdu09Database:
         """Read the accessory database. Prefer the 0x09 bulk read; if the
         accessory does not implement it, rebuild from signature reads.
 
@@ -626,6 +634,8 @@ class CoAPHomeKitConnection:
                 try:
                     info = Pdu09Database.decode(body)
                     logger.debug(f"Get accessory info: {info.to_dict()!r}")
+                    # max_iid only bounds the walk; 0x09 truncated nothing.
+                    self.database_is_partial = False
                     return info
                 except Exception as exc:
                     # Fall back this time, but 0x09 did respond, so it is not
@@ -642,7 +652,7 @@ class CoAPHomeKitConnection:
             await self.do_pair_verify(self._pairing_data)
 
         logger.debug("Rebuilding accessory database via signature reads")
-        signatures = await self._signature_walk()
+        signatures = await self._signature_walk(max_iid)
         if not signatures:
             raise AccessoryDisconnectedError("Unable to parse accessory database")
         logger.debug("Signature walk found %d characteristics: %s", len(signatures), sorted(signatures))
@@ -655,19 +665,28 @@ class CoAPHomeKitConnection:
                 f"of {len(signatures)} could be decoded"
             )
 
+        # Tell the caller, so it can finish the enumeration off any deadline.
+        self.database_is_partial = max_iid < SIGNATURE_WALK_MAX_IID
+
         # No usable 0x09 reply. Unless it did respond with bytes we could not
         # parse, remember it as unsupported so later reads skip the probe.
         if not got_bytes:
             self._gatt_unsupported = True
         return info
 
-    async def get_accessory_info(self):
-        """Read the accessory database and every readable value."""
-        async with self._enumeration_lock:
-            return await self._get_accessory_info()
+    async def get_accessory_info(self, max_iid: int = SIGNATURE_WALK_MAX_IID):
+        """Read the accessory database and every readable value.
 
-    async def _get_accessory_info(self):
-        self.info = await self._read_gatt_database()
+        `max_iid` bounds a signature walk, should one be needed. Pass
+        MINIMAL_ENUM_MAX_IID to read just the Accessory Information service, which
+        is enough to identify the accessory and is fast enough for an interactive
+        pairing; the caller is then responsible for completing the enumeration.
+        """
+        async with self._enumeration_lock:
+            return await self._get_accessory_info(max_iid)
+
+    async def _get_accessory_info(self, max_iid: int):
+        self.info = await self._read_gatt_database(max_iid)
 
         # read all values
         for accessory in self.info.accessories:

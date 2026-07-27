@@ -16,15 +16,12 @@ from aiocoap.error import Error as AiocoapError
 
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import (
+    MINIMAL_ENUM_MAX_IID,
     SIGNATURE_WALK_MAX_IID,
     CoAPHomeKitConnection,
 )
 from aiohomekit.controller.coap.pdu import OpCode, PDUStatus
-from aiohomekit.exceptions import (
-    AccessoryDisconnectedError,
-    AuthenticationError,
-    EncryptionError,
-)
+from aiohomekit.exceptions import AccessoryDisconnectedError, AuthenticationError, EncryptionError
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
 ACCESSORY_INFORMATION = 0x3E
@@ -168,6 +165,39 @@ async def test_walk_stops_after_a_long_run_of_gaps():
     assert 15 in conn.enc_ctx.walked_iids
 
 
+async def test_minimal_enumeration_is_bounded_and_reported_as_partial():
+    conn = _connection(DEVICE)
+
+    database = await conn._read_gatt_database(MINIMAL_ENUM_MAX_IID)
+
+    assert max(conn.enc_ctx.walked_iids) < MINIMAL_ENUM_MAX_IID
+    # Accessory Information only: the sensor at iid 15 is beyond the bound.
+    assert _chars(database) == [2, 3]
+    assert conn.database_is_partial
+
+
+async def test_full_enumeration_is_not_reported_as_partial():
+    conn = _connection(DEVICE)
+
+    await conn._read_gatt_database()
+
+    assert not conn.database_is_partial
+
+
+async def test_bulk_read_is_never_partial_even_when_bounded():
+    # max_iid only bounds the fallback walk. An accessory that answers 0x09 returns
+    # its whole database, so a bounded request must not be treated as incomplete.
+    stub = CoAPHomeKitConnection.__new__(CoAPHomeKitConnection)
+    encoded = CoAPHomeKitConnection._database_from_signatures(stub, DEVICE).encode()
+    conn = _connection(DEVICE, gatt_error=None, gatt_body=encoded)
+
+    database = await conn._read_gatt_database(MINIMAL_ENUM_MAX_IID)
+
+    assert _chars(database) == [2, 3, 15]
+    assert not conn.database_is_partial
+    assert conn.enc_ctx.walked_iids == [], "0x09 answered, so no walk was needed"
+
+
 async def test_reconnect_without_pairing_data_fails_cleanly():
     conn = _connection(DEVICE)
     conn._pairing_data = None
@@ -307,10 +337,41 @@ async def test_concurrent_enumerations_are_serialised():
         async with conn._enumeration_lock:
             in_flight += 1
             try:
-                await conn._get_accessory_info()
+                await conn._get_accessory_info(SIGNATURE_WALK_MAX_IID)
             finally:
                 in_flight -= 1
 
     await asyncio.gather(enumerate(), enumerate())
 
     assert _chars(conn.info) == [2, 3, 15]
+
+
+class FakePairing:
+    """Minimal stand-in for CoAPPairing's collaborators."""
+
+    def __init__(self, partial):
+        self.connection = type("C", (), {"database_is_partial": partial})()
+        self.name = "test"
+        self.config_num = 2
+        self.processed = 0
+
+    async def _process_config_changed(self, config_num):
+        self.processed += 1
+
+
+async def test_completion_is_skipped_when_the_database_is_already_full():
+    # A reconnect (or a controller that re-reads after pairing) may complete the
+    # accessory before the scheduled pass runs; it must not read it all again.
+    from aiohomekit.controller.coap.pairing import CoAPPairing
+
+    pairing = FakePairing(partial=False)
+    await CoAPPairing._complete_enumeration(pairing)
+    assert pairing.processed == 0
+
+
+async def test_completion_runs_while_the_database_is_partial():
+    from aiohomekit.controller.coap.pairing import CoAPPairing
+
+    pairing = FakePairing(partial=True)
+    await CoAPPairing._complete_enumeration(pairing)
+    assert pairing.processed == 1

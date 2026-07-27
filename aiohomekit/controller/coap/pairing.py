@@ -30,7 +30,11 @@ from aiohomekit.utils import async_create_task
 from aiohomekit.uuid import normalize_uuid
 from aiohomekit.zeroconf import ZeroconfPairing
 
-from .connection import CoAPHomeKitConnection
+from .connection import (
+    MINIMAL_ENUM_MAX_IID,
+    SIGNATURE_WALK_MAX_IID,
+    CoAPHomeKitConnection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,7 @@ class CoAPPairing(ZeroconfPairing):
         self.connection_future = None
         self.connection_lock = asyncio.Condition()
         self.pairing_data = pairing_data
+        self._full_enumeration_task: asyncio.Task | None = None
 
         super().__init__(controller, pairing_data)
 
@@ -89,7 +94,9 @@ class CoAPPairing(ZeroconfPairing):
             # if there isn't a connection in progress, we're in the driver's seat
             if self.connection_future is None:
                 # start a connection but don't await it here
-                self.connection_future = self.connection.connect(self.pairing_data)
+                self.connection_future = self.connection.connect(
+                    self.pairing_data, self._enumeration_max_iid()
+                )
             else:
                 # we'll wait on the primary coroutine & copy how it returns
                 # this drops the lock and reacquires it when we're notified
@@ -139,7 +146,7 @@ class CoAPPairing(ZeroconfPairing):
     async def list_accessories_and_characteristics(self) -> list[dict[str, Any]]:
         await self._ensure_connected()
 
-        accessories = await self.connection.get_accessory_info()
+        accessories = await self.connection.get_accessory_info(self._enumeration_max_iid())
 
         for accessory in accessories:
             for service in accessory["services"]:
@@ -150,7 +157,56 @@ class CoAPPairing(ZeroconfPairing):
 
         self._accessories_state = AccessoriesState(Accessories.from_list(accessories), self.config_num or 0)
         self._update_accessories_state_cache()
+
+        if self.connection.database_is_partial:
+            self._schedule_full_enumeration()
+
         return accessories
+
+    def _enumeration_max_iid(self) -> int:
+        """How far a signature-walk fallback may scan for this enumeration.
+
+        On first contact, stop after the Accessory Information service: that is
+        enough to persist the pairing, and a full walk on a sleepy Thread accessory
+        outlasts a controller's pairing dialog. _complete_enumeration() reads the
+        rest immediately afterwards, off that deadline.
+        """
+        if self._accessories_state is None:
+            return MINIMAL_ENUM_MAX_IID
+        return SIGNATURE_WALK_MAX_IID
+
+    def _schedule_full_enumeration(self) -> None:
+        """Finish an enumeration that was cut short to meet a pairing deadline."""
+        task = self._full_enumeration_task
+        if task is not None and not task.done():
+            return
+        self._full_enumeration_task = async_create_task(
+            self._complete_enumeration(), name=f"coap-full-enumeration-{self.id}"
+        )
+
+    async def _complete_enumeration(self) -> None:
+        """Re-enumerate in full and publish the result.
+
+        Runs after a first contact that only read the Accessory Information
+        service. Re-uses the config-changed path so the controller picks up the
+        characteristics that were not in the partial database.
+        """
+        if not self.connection.database_is_partial:
+            # Something else read the accessory in full first -- a reconnect, or a
+            # controller that re-reads after pairing. Nothing left to complete.
+            logger.debug("%s: accessory already read in full; nothing to complete", self.name)
+            return
+
+        try:
+            await self._process_config_changed(self.config_num or 0)
+        except Exception:
+            # The accessory stays usable with the partial database and the next
+            # reconnect enumerates it in full, so this is not fatal.
+            logger.exception(
+                "%s: failed to complete the accessory enumeration; the accessory "
+                "will be described in full after the next reconnect",
+                self.name,
+            )
 
     async def _process_config_changed(self, config_num: int) -> None:
         """Process a config change.
