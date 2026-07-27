@@ -8,6 +8,7 @@ devices yield one accessory and bridges yield one per accessory.
 """
 
 import struct
+import uuid
 
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import CoAPHomeKitConnection
@@ -65,6 +66,36 @@ def test_multi_accessory_split_on_second_accessory_information():
     # the write path looks up by (aid, iid): iid 11 belongs to accessory 2 only
     assert db.find_characteristic_by_aid_iid(2, 11) is not None
     assert db.find_characteristic_by_aid_iid(1, 11) is None
+
+
+def test_types_in_the_homekit_base_range_are_shortened():
+    """Signatures carry full 128-bit UUIDs, but the 0x09 database reports the short
+    form, and lookups like find_service_characteristic_by_type() are written against
+    it. Without shortening, a walk-built database silently breaks those lookups --
+    remove_pairing() and list_pairings() can never find the pairing service."""
+
+    def full(short):
+        """The full HomeKit UUID an accessory actually puts in a signature."""
+        return uuid.UUID(f"{short:08X}-0000-1000-8000-0026BB765291").int
+
+    pairing_service = 0x55
+    pairing_pairings = 0x50
+    vendor = uuid.UUID("E863F117-079E-48FF-8F27-9C2605A29F52").int
+    sigs = {
+        2: _sig(full(0x14), full(ACCESSORY_INFORMATION), 1),
+        18: _sig(full(pairing_pairings), full(pairing_service), 17),
+        32: _sig(vendor, full(0x96), 30),
+    }
+    db = _conn()._database_from_signatures(sigs)
+    accessory = db.accessories[0]
+
+    assert accessory.find_service_by_type(pairing_service) is not None
+    found = accessory.find_service_characteristic_by_type(pairing_service, pairing_pairings)
+    assert found is not None and found.instance_id == 18
+
+    # Vendor UUIDs are outside the HomeKit base range and must survive intact.
+    vendor_chars = [c for s in accessory.services for c in s.characteristics if c.type == vendor]
+    assert len(vendor_chars) == 1
 
 
 def test_accessories_that_reuse_service_instance_ids_are_still_split():

@@ -81,6 +81,19 @@ _WALK_EXPECTED_STATUSES = frozenset(
 )
 # Both UUID forms: 0x09 reports the short one, signatures the full one.
 _ACCESSORY_INFORMATION_SERVICE = frozenset({0x3E, uuid.UUID("0000003E-0000-1000-8000-0026BB765291").int})
+# 0x09 reports base-range types in short form and lookups are written against
+# that, but signatures always carry the full 128-bit UUID.
+_HAP_BASE_UUID = uuid.UUID("00000000-0000-1000-8000-0026BB765291").int
+_HAP_BASE_SUFFIX_MASK = (1 << 96) - 1
+
+
+def _shorten_type(type_: int) -> int:
+    """Return the short HomeKit type for a full base UUID, else the value as-is."""
+    if type_ & _HAP_BASE_SUFFIX_MASK == _HAP_BASE_UUID & _HAP_BASE_SUFFIX_MASK:
+        return type_ >> 96
+    return type_
+
+
 # How a dropped 0x09 surfaces: no reply at all, a 404 whose response then fails
 # to decrypt, or the transport being torn down mid-request.
 _PROBE_FAILURES: tuple[type[BaseException], ...] = (
@@ -519,7 +532,7 @@ class CoAPHomeKitConnection:
                 logger.debug("Skipping iid %d, signature decode failed: %r", iid, exc)
                 continue
 
-            svc_type = int.from_bytes(sig.service_type, "little") if sig.service_type else 0
+            svc_type = _shorten_type(int.from_bytes(sig.service_type, "little") if sig.service_type else 0)
             svc_iid = int.from_bytes(sig.service_instance_id, "little") if sig.service_instance_id else 0
             is_accessory_info = svc_type in _ACCESSORY_INFORMATION_SERVICE
 
@@ -543,7 +556,7 @@ class CoAPHomeKitConnection:
             service._characteristics.append(
                 Pdu09CharacteristicContainer(
                     characteristic=Pdu09Characteristic(
-                        type=sig.type,
+                        type=_shorten_type(sig.type),
                         instance_id=iid,
                         properties=sig.properties,
                         presentation_format=sig.presentation_format,
