@@ -21,10 +21,11 @@ import logging
 import random
 import struct
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import Any
 
 from aiocoap import Context, Message, resource
+from aiocoap.error import Error as AiocoapError
 from aiocoap.error import NetworkError
 from aiocoap.numbers.codes import Code
 from cryptography.exceptions import InvalidTag
@@ -44,6 +45,7 @@ from aiohomekit.protocol import (
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 from aiohomekit.utils import asyncio_timeout
 
+from ..ble.structs import Characteristic as CharacteristicTLV
 from .pdu import (
     OpCode,
     PDUStatus,
@@ -52,9 +54,41 @@ from .pdu import (
     encode_all_pdus,
     encode_pdu,
 )
-from .structs import Pdu09Database
+from .structs import (
+    Pdu09Accessory,
+    Pdu09AccessoryContainer,
+    Pdu09Characteristic,
+    Pdu09CharacteristicContainer,
+    Pdu09Database,
+    Pdu09Service,
+    Pdu09ServiceContainer,
+)
 
 logger = logging.getLogger(__name__)
+
+# Only paid until the accessory is remembered as not supporting 0x09, so be
+# generous: a slow but supported accessory must not trip it.
+GATT_PROBE_TIMEOUT = 10.0
+# The walk result is cached, so it favours completeness over speed: a wide iid
+# range, and the database is only assumed to end after a long run of gaps.
+SIGNATURE_WALK_MAX_IID = 300
+SIGNATURE_WALK_MAX_MISSES = 25
+# First accessory's instance id; bridges increment from here.
+COAP_ACCESSORY_IID = 1
+# Probing a contiguous iid range legitimately misses; not worth a warning.
+_WALK_EXPECTED_STATUSES = frozenset(
+    {PDUStatus.INVALID_INSTANCE_ID, PDUStatus.INVALID_REQUEST, PDUStatus.UNSUPPORTED_PDU}
+)
+# Both UUID forms: 0x09 reports the short one, signatures the full one.
+_ACCESSORY_INFORMATION_SERVICE = frozenset({0x3E, uuid.UUID("0000003E-0000-1000-8000-0026BB765291").int})
+# How a dropped 0x09 surfaces: no reply at all, a 404 whose response then fails
+# to decrypt, or the transport being torn down mid-request.
+_PROBE_FAILURES: tuple[type[BaseException], ...] = (
+    AccessoryDisconnectedError,
+    EncryptionError,
+    asyncio.TimeoutError,
+    AiocoapError,
+)
 
 
 def decode_pdu_03(buf):
@@ -175,11 +209,18 @@ class EncryptionContext:
 
             return await self._decrypt_response(response)
 
-    async def post(self, opcode: OpCode, iid: int, data: bytes) -> tuple[int, bytes | PDUStatus]:
+    async def post(
+        self,
+        opcode: OpCode,
+        iid: int,
+        data: bytes,
+        timeout: float = 16.0,
+        expected_statuses: Collection[PDUStatus] = (),
+    ) -> tuple[int, bytes | PDUStatus]:
         tid = random.randint(1, 254)
         req_pdu = encode_pdu(opcode, tid, iid, data)
-        res_pdu = await self.post_bytes(req_pdu)
-        return decode_pdu(tid, res_pdu)
+        res_pdu = await self.post_bytes(req_pdu, timeout)
+        return decode_pdu(tid, res_pdu, expected_statuses)
 
     async def post_all(self, opcode: OpCode, iids: list[int], data: list[bytes]) -> list[bytes | PDUStatus]:
         req_pdu = encode_all_pdus(opcode, iids, data)
@@ -241,8 +282,24 @@ class CoAPHomeKitConnection:
         self.enc_ctx = None
         self.owner = owner
         self.pair_setup_client = None
+        self._pairing_data = None
+        # Never cleared: re-probing costs a timeout *and* tears the session down
+        # again on affected firmware. Latching on a one-off failure only costs
+        # speed, since the walk is plain HAP and works on any accessory.
+        self._gatt_unsupported = False
+        # Serialises enumeration against reconnects; see reconnect_soon().
+        self._enumeration_lock = asyncio.Lock()
 
     async def reconnect_soon(self):
+        if not self.enc_ctx:
+            return
+        # A walk is many sequential requests, so unlike a single 0x09 read it is
+        # likely to be in flight when a fresh pairing changes the endpoint, and
+        # tearing the session down underneath it would abort the enumeration.
+        if self._enumeration_lock.locked():
+            logger.debug("Deferring reconnect until the in-progress enumeration finishes")
+            async with self._enumeration_lock:
+                pass
         if not self.enc_ctx:
             return
         await self.enc_ctx.coap_ctx.shutdown()
@@ -318,6 +375,9 @@ class CoAPHomeKitConnection:
         return pairing
 
     async def do_pair_verify(self, pairing_data):
+        # Remembered so _read_gatt_database can pair-verify again: a dropped 0x09
+        # kills the session, and the walk that follows needs a live one.
+        self._pairing_data = pairing_data
         if self.is_connected:
             logger.debug("Connecting to connected device?")
             await self.enc_ctx.coap_ctx.shutdown()
@@ -391,15 +451,210 @@ class CoAPHomeKitConnection:
     def is_connected(self):
         return self.enc_ctx is not None and self.enc_ctx.coap_ctx is not None
 
-    async def get_accessory_info(self):
-        _, body = await self.enc_ctx.post(OpCode.UNK_09_READ_GATT, 0x0000, b"")
+    async def _signature_walk(self) -> dict[int, bytes]:
+        """Enumerate the accessory database by reading each characteristic's
+        signature (0x01), used when 0x09 is unavailable. Invalid iids come back
+        fast as a PDUStatus, so probing a contiguous range is cheap; stop after a
+        long run of gaps.
+        """
+        signatures: dict[int, bytes] = {}
+        misses = 0
+        for iid in range(1, SIGNATURE_WALK_MAX_IID):
+            result = await self.enc_ctx.post(
+                OpCode.CHAR_SIG_READ,
+                iid,
+                b"",
+                expected_statuses=_WALK_EXPECTED_STATUSES,
+            )
+            body = result[1] if result is not None else None
+            if isinstance(body, (bytes, bytearray)):
+                signatures[iid] = bytes(body)
+                misses = 0
+            else:
+                misses += 1
+                if misses >= SIGNATURE_WALK_MAX_MISSES:
+                    logger.debug(
+                        "Signature walk stopping at iid %d after %d consecutive "
+                        "misses; assuming end of database",
+                        iid,
+                        misses,
+                    )
+                    break
+        else:
+            # Ran out of range with no long gap: the accessory may have
+            # characteristics above the scan limit that we are about to drop.
+            logger.warning(
+                "Signature walk reached the iid scan limit (%d); the accessory database may be incomplete",
+                SIGNATURE_WALK_MAX_IID,
+            )
+        return signatures
 
-        try:
-            self.info = Pdu09Database.decode(body)
-            logger.debug(f"Get accessory info: {self.info.to_dict()!r}")
-        except Exception as exc:
-            logger.error(f"TLV decode failed: {body.hex()}", exc_info=exc)
+    def _database_from_signatures(self, signatures: dict[int, bytes]) -> Pdu09Database:
+        """Rebuild a Pdu09Database from per-characteristic signature reads.
+
+        Each signature carries its parent service (type + instance id) but not an
+        accessory id. Every HAP accessory begins with one Accessory Information
+        service, so characteristics are grouped into services and a new accessory
+        is started whenever a second Accessory Information service appears (in iid
+        order). Single-accessory devices -- the common HAP-over-Thread case --
+        produce one accessory (id 1); bridges produce one accessory per
+        Accessory Information service.
+        """
+        accessories: list[tuple[dict[int, Pdu09Service], list[int]]] = []
+        services: dict[int, Pdu09Service] = {}
+        order: list[int] = []
+        # A new accessory is recognised by an Accessory Information service that
+        # either carries a different instance id or repeats a characteristic type
+        # (bridges may number services per accessory, so the iid alone is not
+        # always enough).
+        current_info_iid: int | None = None
+        current_info_types: set[int] = set()
+        decode_failures = 0
+
+        for iid in sorted(signatures):
+            try:
+                sig = CharacteristicTLV.decode(signatures[iid])
+            except Exception as exc:
+                decode_failures += 1
+                logger.debug("Skipping iid %d, signature decode failed: %r", iid, exc)
+                continue
+
+            svc_type = int.from_bytes(sig.service_type, "little") if sig.service_type else 0
+            svc_iid = int.from_bytes(sig.service_instance_id, "little") if sig.service_instance_id else 0
+            is_accessory_info = svc_type in _ACCESSORY_INFORMATION_SERVICE
+
+            if is_accessory_info and current_info_iid is not None:
+                if svc_iid != current_info_iid or sig.type in current_info_types:
+                    accessories.append((services, order))
+                    services, order = {}, []
+                    current_info_iid, current_info_types = None, set()
+
+            service = services.get(svc_iid)
+            if service is None:
+                service = Pdu09Service(
+                    type=svc_type,
+                    instance_id=svc_iid,
+                    _characteristics=[],
+                    properties=0,
+                    linked_services=None,
+                )
+                services[svc_iid] = service
+                order.append(svc_iid)
+            service._characteristics.append(
+                Pdu09CharacteristicContainer(
+                    characteristic=Pdu09Characteristic(
+                        type=sig.type,
+                        instance_id=iid,
+                        properties=sig.properties,
+                        presentation_format=sig.presentation_format,
+                        valid_range=sig.valid_range,
+                        step_value=sig.step_value,
+                        valid_values=sig.valid_values,
+                        valid_values_range=sig.valid_values_range,
+                        user_descriptor=sig.user_description,
+                    )
+                )
+            )
+            if is_accessory_info:
+                current_info_iid = svc_iid
+                current_info_types.add(sig.type)
+
+        accessories.append((services, order))
+        if decode_failures:
+            logger.warning(
+                "Discarded %d of %d characteristic signatures that failed to decode",
+                decode_failures,
+                len(signatures),
+            )
+
+        containers = []
+        aid = COAP_ACCESSORY_IID
+        for accessory_services, service_order in accessories:
+            if not accessory_services:
+                continue
+            containers.append(
+                Pdu09AccessoryContainer(
+                    accessory=Pdu09Accessory(
+                        instance_id=aid,
+                        _services=[
+                            Pdu09ServiceContainer(service=accessory_services[i]) for i in service_order
+                        ],
+                    )
+                )
+            )
+            aid += 1
+        return Pdu09Database(_accessories=containers)
+
+    async def _read_gatt_database(self) -> Pdu09Database:
+        """Read the accessory database. Prefer the 0x09 bulk read; if the
+        accessory does not implement it, rebuild from signature reads.
+
+        Some Thread accessories (e.g. Eve Room, HA #167379) silently drop 0x09
+        *and* tear down the secured session, so on a 0x09 timeout we must
+        re-establish the session (pair-verify) before reading another way. Once
+        an accessory is known not to answer 0x09 the probe is skipped entirely on
+        later reads, avoiding both its timeout and the teardown it causes.
+        """
+        session_alive = True
+        got_bytes = False
+        body = None
+        if not self._gatt_unsupported:
+            try:
+                _, body = await self.enc_ctx.post(
+                    OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=GATT_PROBE_TIMEOUT
+                )
+            except _PROBE_FAILURES:
+                # The session is gone; it has to come back before we read on.
+                logger.debug("0x09 not answered; will reconnect and rebuild without it")
+                session_alive = False
+
+            if isinstance(body, (bytes, bytearray)):
+                got_bytes = True
+                try:
+                    info = Pdu09Database.decode(body)
+                    logger.debug(f"Get accessory info: {info.to_dict()!r}")
+                    return info
+                except Exception as exc:
+                    # Fall back this time, but 0x09 did respond, so it is not
+                    # remembered as unsupported.
+                    logger.error(f"TLV decode failed: {body.hex()}", exc_info=exc)
+            elif body is not None:
+                # A PDUStatus error: 0x09 unsupported, session still healthy.
+                logger.debug("0x09 returned status %r; rebuilding without it", body)
+
+        if not session_alive:
+            # The walk and the value reads that follow need a live session.
+            if self._pairing_data is None:
+                raise AccessoryDisconnectedError("Cannot re-establish session: pairing data unavailable")
+            await self.do_pair_verify(self._pairing_data)
+
+        logger.debug("Rebuilding accessory database via signature reads")
+        signatures = await self._signature_walk()
+        if not signatures:
             raise AccessoryDisconnectedError("Unable to parse accessory database")
+        logger.debug("Signature walk found %d characteristics: %s", len(signatures), sorted(signatures))
+        info = self._database_from_signatures(signatures)
+        if not info.accessories:
+            # An empty database would be cached by the controller as a valid but
+            # characteristic-less accessory; fail instead and let the caller retry.
+            raise AccessoryDisconnectedError(
+                "Unable to parse accessory database: no characteristic signature "
+                f"of {len(signatures)} could be decoded"
+            )
+
+        # No usable 0x09 reply. Unless it did respond with bytes we could not
+        # parse, remember it as unsupported so later reads skip the probe.
+        if not got_bytes:
+            self._gatt_unsupported = True
+        return info
+
+    async def get_accessory_info(self):
+        """Read the accessory database and every readable value."""
+        async with self._enumeration_lock:
+            return await self._get_accessory_info()
+
+    async def _get_accessory_info(self):
+        self.info = await self._read_gatt_database()
 
         # read all values
         for accessory in self.info.accessories:
