@@ -954,4 +954,27 @@ class CoAPHomeKitConnection:
                 raise AuthenticationError("Remove pairing failed")
             raise UnknownError("Remove pairing failed")
 
+        # The procedure is not complete until M2 is read back: accessories exist
+        # that do not apply the removal until then, so writing alone leaves the
+        # pairing in place while telling the caller it succeeded.
+        result_len, result = await self.enc_ctx.post(
+            OpCode.CHAR_READ,
+            pairings_characteristic.instance_id,
+            b"",
+        )
+        if isinstance(result, PDUStatus):
+            raise UnknownError(f"Remove pairing failed, M2 unreadable: {result.description}")
+
+        m2 = decode_list_pairings_response(result)
+
+        m2_state = [entry for entry in m2 if entry[0] == TLV.kTLVType_State]
+        if len(m2_state) != 1 or m2_state[0][1] != TLV.M2:
+            raise UnknownError("Unexpected state in remove pairing M2")
+
+        m2_error = [entry for entry in m2 if entry[0] == TLV.kTLVType_Error]
+        if m2_error:
+            if m2_error[0][1] == TLV.kTLVError_Authentication:
+                raise AuthenticationError("Remove pairing failed")
+            raise UnknownError(f"Remove pairing failed: {m2_error[0][1]}")
+
         return True

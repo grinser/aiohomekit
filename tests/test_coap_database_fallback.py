@@ -9,6 +9,7 @@ happens when the signatures themselves are unusable.
 
 import asyncio
 import struct
+import uuid
 
 import pytest
 from aiocoap.error import Error as AiocoapError
@@ -19,7 +20,12 @@ from aiohomekit.controller.coap.connection import (
     CoAPHomeKitConnection,
 )
 from aiohomekit.controller.coap.pdu import OpCode, PDUStatus
-from aiohomekit.exceptions import AccessoryDisconnectedError, EncryptionError
+from aiohomekit.exceptions import (
+    AccessoryDisconnectedError,
+    AuthenticationError,
+    EncryptionError,
+)
+from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
 ACCESSORY_INFORMATION = 0x3E
 
@@ -168,6 +174,64 @@ async def test_reconnect_without_pairing_data_fails_cleanly():
 
     with pytest.raises(AccessoryDisconnectedError):
         await conn._read_gatt_database()
+
+
+class FakePairingsContext(FakeEncryptionContext):
+    """Serves the Pairing service so remove_pairing() can be driven end to end."""
+
+    def __init__(self, m2_error=None):
+        pairing_service = uuid.UUID("00000055-0000-1000-8000-0026BB765291").int
+        pairing_pairings = uuid.UUID("00000050-0000-1000-8000-0026BB765291").int
+        info = uuid.UUID("0000003E-0000-1000-8000-0026BB765291").int
+        super().__init__(
+            {
+                2: _sig(uuid.UUID("00000014-0000-1000-8000-0026BB765291").int, info, 1),
+                18: _sig(pairing_pairings, pairing_service, 17),
+            },
+            gatt_error=None,
+        )
+        self.m2_error = m2_error
+        self.writes = []
+        self.m2_reads = 0
+
+    async def post(self, opcode, iid, data, timeout=16.0, expected_statuses=()):
+        if opcode is OpCode.CHAR_WRITE and iid == 18:
+            self.writes.append(bytes(data))
+            return (0, b"")
+        if opcode is OpCode.CHAR_READ and iid == 18:
+            self.m2_reads += 1
+            entries = [(TLV.kTLVType_State, TLV.M2)]
+            if self.m2_error is not None:
+                entries.append((TLV.kTLVType_Error, self.m2_error))
+            body = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, TLV.encode_list(entries))])
+            return (len(body), body)
+        return await super().post(opcode, iid, data, timeout, expected_statuses)
+
+
+async def _connected_for_pairings(m2_error=None):
+    conn = _connection({})
+    conn.enc_ctx = FakePairingsContext(m2_error)
+    conn.info = await conn._read_gatt_database()
+    return conn
+
+
+async def test_remove_pairing_reads_m2_back():
+    # Writing M1 alone is not the whole procedure: accessories exist that only
+    # apply the removal once the response is collected.
+    conn = await _connected_for_pairings()
+
+    assert await conn.remove_pairing("some-controller-id") is True
+    assert conn.enc_ctx.writes, "M1 must be written"
+    assert conn.enc_ctx.m2_reads == 1, "M2 must be read back"
+
+
+async def test_remove_pairing_reports_an_error_returned_in_m2():
+    # Without reading M2 this failure is invisible and the caller is told the
+    # pairing was removed when it was not.
+    conn = await _connected_for_pairings(m2_error=TLV.kTLVError_Authentication)
+
+    with pytest.raises(AuthenticationError):
+        await conn.remove_pairing("some-controller-id")
 
 
 class FakeCoapContext:
