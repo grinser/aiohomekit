@@ -84,9 +84,21 @@ _WALK_EXPECTED_STATUSES = frozenset(
 _WALK_SKIPPABLE_STATUSES = frozenset(
     {PDUStatus.INSUFFICIENT_AUTHENTICATION, PDUStatus.INSUFFICIENT_AUTHORIZATION}
 )
-# A second one of these marks the start of another accessory. Signatures may
-# carry either the short or the full UUID form.
-_ACCESSORY_INFORMATION_SERVICE = frozenset({0x3E, uuid.UUID("0000003E-0000-1000-8000-0026BB765291").int})
+# A second one of these marks the start of another accessory.
+_ACCESSORY_INFORMATION_SERVICE = 0x3E
+# 0x09 reports base-range types in short form and lookups are written against
+# that, but signatures always carry the full 128-bit UUID.
+_HAP_BASE_UUID = uuid.UUID("00000000-0000-1000-8000-0026BB765291").int
+_HAP_BASE_SUFFIX_MASK = (1 << 96) - 1
+
+
+def _shorten_type(type_: int) -> int:
+    """Return the short HomeKit type for a full base UUID, else the value as-is."""
+    if type_ & _HAP_BASE_SUFFIX_MASK == _HAP_BASE_UUID & _HAP_BASE_SUFFIX_MASK:
+        return type_ >> 96
+    return type_
+
+
 # How a dropped 0x09 surfaces: no reply at all, a 404 whose response then fails
 # to decrypt, or the transport being torn down mid-request.
 _PROBE_FAILURES: tuple[type[BaseException], ...] = (
@@ -580,9 +592,9 @@ class CoAPHomeKitConnection:
                 logger.debug("Skipping iid %d, signature carries no service", iid)
                 continue
 
-            svc_type = int.from_bytes(sig.service_type, "little")
+            svc_type = _shorten_type(int.from_bytes(sig.service_type, "little"))
             svc_iid = int.from_bytes(sig.service_instance_id, "little")
-            is_accessory_info = svc_type in _ACCESSORY_INFORMATION_SERVICE
+            is_accessory_info = svc_type == _ACCESSORY_INFORMATION_SERVICE
 
             if is_accessory_info and current_info_iid is not None:
                 if svc_iid != current_info_iid or sig.type in current_info_types:
@@ -604,7 +616,7 @@ class CoAPHomeKitConnection:
             service._characteristics.append(
                 Pdu09CharacteristicContainer(
                     characteristic=Pdu09Characteristic(
-                        type=sig.type,
+                        type=_shorten_type(sig.type),
                         instance_id=iid,
                         properties=sig.properties,
                         presentation_format=sig.presentation_format,
