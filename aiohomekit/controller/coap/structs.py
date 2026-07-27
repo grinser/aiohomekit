@@ -19,6 +19,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
+from aiohomekit.model.characteristics.characteristic_formats import (
+    BleCharacteristicFormats,
+)
 from aiohomekit.protocol.tlv import HAP_TLV
 from aiohomekit.tlv8 import TLVStruct, tlv_entry, u16, u128
 
@@ -93,17 +96,12 @@ class Pdu09Characteristic(TLVStruct):
 
     @property
     def data_type_str(self):
-        if self.pf_format == 0x01:
-            return "bool"
-        if self.pf_format in [0x04, 0x06, 0x08, 0x0A, 0x10]:
-            return "int"
-        if self.pf_format == 0x14:
-            return "float"
-        if self.pf_format == 0x19:
-            return "string"
-        if self.pf_format == 0x1B:
-            return "data"
-        return "unknown"
+        # Collapsing every integer to "int" is lossy: the cached entity map
+        # (produced from to_dict) then can't tell uint8 from uint32, so a database
+        # can't be rebuilt from it. The format byte is the BLE GATT format.
+        if self.pf_format is None:
+            return "unknown"
+        return BleCharacteristicFormats.get(self.pf_format, "unknown")
 
     @property
     def pf_unit(self):
