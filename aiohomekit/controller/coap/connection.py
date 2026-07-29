@@ -42,7 +42,7 @@ from aiohomekit.protocol import (
     perform_pair_setup_part1,
     perform_pair_setup_part2,
 )
-from aiohomekit.protocol.tlv import HAP_TLV, TLV
+from aiohomekit.protocol.tlv import HAP_TLV, K_TLV_ERROR_NAMES, TLV
 from aiohomekit.utils import asyncio_timeout
 
 from ..ble.structs import Characteristic as CharacteristicTLV
@@ -65,6 +65,10 @@ from .structs import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Short: removing our own pairing ends the session, so this read often gets no
+# answer, and the caller should not wait a full request timeout to find out.
+REMOVE_PAIRING_M2_TIMEOUT = 4.0
 
 DEFAULT_POST_TIMEOUT = 16.0
 # A probe that times out latches 0x09 off for the life of the connection, so this
@@ -1029,6 +1033,9 @@ class CoAPHomeKitConnection:
                 (TLV.kTLVType_Identifier, pairing_id.encode()),
             ]
         )
+        # As with list_pairings() above, kTLVHAPParamParamReturnResponse is not
+        # set: it is a BLE-transport write parameter, and this procedure
+        # completes without it against real hardware.
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
         result_len, result = await self.enc_ctx.post(
             OpCode.CHAR_WRITE,
@@ -1036,7 +1043,6 @@ class CoAPHomeKitConnection:
             payload,
         )
 
-        # iOS didn't retrieve M2 from the pairings characteristic
         if isinstance(result, PDUStatus):
             if result in [
                 PDUStatus.INSUFFICIENT_AUTHENTICATION,
@@ -1044,5 +1050,48 @@ class CoAPHomeKitConnection:
             ]:
                 raise AuthenticationError("Remove pairing failed")
             raise UnknownError("Remove pairing failed")
+
+        # The procedure is not complete until M2 is read back: accessories exist
+        # (e.g. Eve firmware over Thread) that do not apply the removal until
+        # the response is collected, so writing alone leaves the pairing in
+        # place while telling the caller it succeeded.
+        #
+        # An unreadable M2 is not a failure: removing our own pairing ends the
+        # session, so the response legitimately may never arrive. M1 was
+        # accepted, so the removal stands -- raising here would make the caller
+        # keep a local record for a pairing the accessory has already dropped,
+        # which is why the broad except below is deliberate.
+        try:
+            async with asyncio_timeout(REMOVE_PAIRING_M2_TIMEOUT):
+                _, result = await self.enc_ctx.post(
+                    OpCode.CHAR_READ,
+                    pairings_characteristic.instance_id,
+                    b"",
+                )
+        except Exception as exc:
+            logger.debug("Remove pairing M2 not read (%r); the removal itself was accepted", exc)
+            return True
+
+        if isinstance(result, PDUStatus) or not result:
+            logger.debug("Remove pairing M2 not readable (%s); the removal itself was accepted", result)
+            return True
+
+        try:
+            m2 = decode_list_pairings_response(result)
+        except Exception as exc:
+            logger.debug("Remove pairing M2 undecodable (%r); the removal itself was accepted", exc)
+            return True
+
+        # The accessory did answer: an explicit error in M2 is a real failure.
+        m2_error = [entry for entry in m2 if entry[0] == TLV.kTLVType_Error]
+        if m2_error:
+            code = m2_error[0][1]
+            if code == TLV.kTLVError_Authentication:
+                raise AuthenticationError("Remove pairing failed")
+            raise UnknownError(f"Remove pairing failed: {K_TLV_ERROR_NAMES.get(code[0], 'Unknown')}")
+
+        m2_state = [entry for entry in m2 if entry[0] == TLV.kTLVType_State]
+        if len(m2_state) != 1 or m2_state[0][1] != TLV.M2:
+            logger.debug("Unexpected state in remove pairing M2: %r", m2_state)
 
         return True
