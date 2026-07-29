@@ -79,6 +79,21 @@ GATT_PROBE_TIMEOUT = 20.0
 # range, and the database is only assumed to end after a long run of gaps.
 SIGNATURE_WALK_MAX_IID = 300
 SIGNATURE_WALK_MAX_MISSES = 25
+# Far enough to reach the Pairing service, which is all list_pairings and
+# remove_pairing need: HAP lays out an accessory's mandatory services first,
+# and on real Eve firmware the Pairings characteristic sits in the first few
+# instance ids. Above SIGNATURE_WALK_MAX_MISSES so a bounded read can still
+# terminate on the miss counter rather than always running to the bound.
+#
+# This narrows the unpair window rather than closing it (~76 s for a full walk
+# against ~40 s bounded, measured on an Eve Room; a controller may only wait a
+# few seconds): the real fix is not enumerating at all for pairing operations.
+PAIRING_SERVICE_MAX_IID = 32
+# 0x09 returns the entire database, which is the opposite of what a bounded
+# read wants, but it is one round-trip when it works. Give it a short window
+# rather than the full probe timeout: on firmware that drops it, the wait is
+# pure latency on an operation the controller is already timing.
+PAIRING_PROBE_TIMEOUT = 4.0
 # First accessory's instance id; bridges increment from here.
 COAP_ACCESSORY_IID = 1
 # Probing a contiguous iid range legitimately misses; not worth a warning.
@@ -468,7 +483,7 @@ class CoAPHomeKitConnection:
 
         return True
 
-    async def connect(self, pairing_data):
+    async def connect(self, pairing_data, enumerate_database: bool = True):
         async with self.connection_lock:
             if self.is_connected:
                 logger.debug("Already connected")
@@ -488,8 +503,15 @@ class CoAPHomeKitConnection:
                 logger.debug("Pair verify failed", exc_info=exc)
                 raise AccessoryDisconnectedError("Pair verify failed")
 
-            # we need the info this provides to be able to read/write characteristics
-            await self.get_accessory_info()
+            if enumerate_database:
+                # Needed to read/write characteristics -- but a pairing
+                # operation needs exactly one characteristic and finds it
+                # itself, so making it wait out a full enumeration here is what
+                # pushes an unpair past the controller's patience. Measured on
+                # an Eve Room: a cold remove_pairing spent 20 s on the 0x09
+                # probe and 23 s in the walk this call started, and was
+                # cancelled 0.3 s before the walk would have finished.
+                await self.get_accessory_info()
 
             return
 
@@ -511,7 +533,7 @@ class CoAPHomeKitConnection:
                 raise AccessoryDisconnectedError("Cannot re-establish session: pairing data unavailable")
             await self.do_pair_verify(self._pairing_data)
 
-    async def _signature_walk(self) -> tuple[dict[int, bytes], bool]:
+    async def _signature_walk(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> tuple[dict[int, bytes], bool]:
         """Enumerate the accessory database by reading each characteristic's
         signature (0x01), used when 0x09 is unavailable. Invalid iids come back
         fast as a PDUStatus, so probing a contiguous range is cheap; stop after a
@@ -520,7 +542,7 @@ class CoAPHomeKitConnection:
         signatures: dict[int, bytes] = {}
         misses = 0
         complete = False
-        for iid in range(1, SIGNATURE_WALK_MAX_IID + 1):
+        for iid in range(1, max_iid + 1):
             if not self.is_connected:
                 raise AccessoryDisconnectedError(f"Session ended during the signature walk at iid {iid}")
             result = await self.enc_ctx.post(
@@ -556,7 +578,7 @@ class CoAPHomeKitConnection:
                 )
                 complete = True
                 break
-        if not complete:
+        if not complete and max_iid == SIGNATURE_WALK_MAX_IID:
             # Ran out of range with no long gap: the accessory may have
             # characteristics above the scan limit that we are about to drop.
             logger.warning(
@@ -669,7 +691,7 @@ class CoAPHomeKitConnection:
             aid += 1
         return Pdu09Database(_accessories=containers)
 
-    async def _read_gatt_database(self) -> Pdu09Database:
+    async def _read_gatt_database(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> Pdu09Database:
         """Read the accessory database. Prefer the 0x09 bulk read; if the
         accessory does not implement it, rebuild from signature reads.
 
@@ -683,8 +705,11 @@ class CoAPHomeKitConnection:
         body = None
         if not self._gatt_unsupported:
             try:
+                probe_timeout = (
+                    GATT_PROBE_TIMEOUT if max_iid == SIGNATURE_WALK_MAX_IID else PAIRING_PROBE_TIMEOUT
+                )
                 _, body = await self.enc_ctx.post(
-                    OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=GATT_PROBE_TIMEOUT
+                    OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=probe_timeout
                 )
             except _PROBE_FAILURES:
                 # No reply at all is the signature of firmware that drops 0x09.
@@ -719,7 +744,7 @@ class CoAPHomeKitConnection:
             await self._reverify_session()
 
         logger.debug("Rebuilding accessory database via signature reads")
-        signatures, walk_complete = await self._signature_walk()
+        signatures, walk_complete = await self._signature_walk(max_iid)
         if not signatures:
             raise AccessoryDisconnectedError("Unable to parse accessory database")
         logger.debug("Signature walk found %d characteristics: %s", len(signatures), sorted(signatures))
@@ -732,10 +757,11 @@ class CoAPHomeKitConnection:
                 f"of {len(signatures)} could be decoded"
             )
 
-        # Whether the walk was cut short, not whether a bound was requested: a
-        # full walk that ends on the miss counter or the scan limit is truncated
-        # too, and must not be published as the whole accessory.
-        self.database_is_partial = not walk_complete
+        # A full walk that ends on the scan limit is truncated; so is *any*
+        # bounded read, even one that ended on the miss counter -- the bound
+        # exists to find one characteristic quickly, and whatever it built must
+        # never be published, cached, or reused as the whole accessory.
+        self.database_is_partial = (not walk_complete) or (max_iid != SIGNATURE_WALK_MAX_IID)
         self.database_from_walk = True
         return info
 
@@ -743,15 +769,20 @@ class CoAPHomeKitConnection:
         """Force the next enumeration to re-read rather than reuse."""
         self.info = None
 
-    async def get_accessory_info(self):
-        """Read the accessory database and every readable value."""
+    async def get_accessory_info(self, max_iid: int = SIGNATURE_WALK_MAX_IID):
+        """Read the accessory database and every readable value.
+
+        `max_iid` bounds a signature walk, should one be needed. It is used only
+        by pairing operations, which need a single characteristic and cannot wait
+        out a full walk; the resulting database is always marked partial.
+        """
         async with self._enumeration_lock:
             if not self.is_connected:
                 # The wait can be long enough for the session to have gone away.
                 raise AccessoryDisconnectedError("Connection lost before enumerating")
-            return await self._enumerate()
+            return await self._enumerate(max_iid)
 
-    async def _enumerate(self):
+    async def _enumerate(self, max_iid: int = SIGNATURE_WALK_MAX_IID):
         if self.info is not None and self.database_from_walk and not self.database_is_partial:
             # Reuse only what a walk built: instance ids do not change without a
             # config-number change (which invalidates this via
@@ -762,7 +793,7 @@ class CoAPHomeKitConnection:
             # exactly as before this fallback existed.
             logger.debug("Reusing the walk-built accessory database; reading values only")
         else:
-            self.info = await self._read_gatt_database()
+            self.info = await self._read_gatt_database(max_iid)
 
         # read all values
         for accessory in self.info.accessories:
@@ -975,8 +1006,27 @@ class CoAPHomeKitConnection:
         pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
         return self._unsubscribe_from_exit(ids, pdu_results)
 
+    async def _pairings_characteristic(self):
+        """Locate the Pairing service's Pairings characteristic.
+
+        Prefers whatever has already been enumerated, then a bounded read, and
+        only then a full one. A full signature walk takes longer than a
+        controller will wait to remove a pairing, and giving up leaves the
+        pairing orphaned on the accessory. Routed through get_accessory_info so
+        the enumeration lock is held: enumerating here directly could clobber a
+        full database another caller was still publishing.
+        """
+        for bound in (None, PAIRING_SERVICE_MAX_IID, SIGNATURE_WALK_MAX_IID):
+            if bound is not None:
+                await self.get_accessory_info(bound)
+            if self.info is not None:
+                char = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+                if char is not None:
+                    return char
+        raise UnknownError("Accessory exposes no Pairing service")
+
     async def list_pairings(self):
-        pairings_characteristic = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+        pairings_characteristic = await self._pairings_characteristic()
 
         # list pairings M1
         m1_payload = TLV.encode_list(
@@ -1023,7 +1073,7 @@ class CoAPHomeKitConnection:
         return list(zip(id_list, pk_list, pr_list))
 
     async def remove_pairing(self, pairing_id) -> bool:
-        pairings_characteristic = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+        pairings_characteristic = await self._pairings_characteristic()
 
         # remove pairings M1
         m1_payload = TLV.encode_list(

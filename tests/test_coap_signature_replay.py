@@ -12,6 +12,7 @@ import json
 import pathlib
 
 from aiohomekit.controller.coap.connection import (
+    PAIRING_SERVICE_MAX_IID,
     SIGNATURE_WALK_MAX_IID,
     SIGNATURE_WALK_MAX_MISSES,
     CoAPHomeKitConnection,
@@ -65,6 +66,18 @@ def test_base_range_types_are_shortened_but_vendor_types_are_not():
     assert ACCESSORY_INFORMATION in service_types
     assert PAIRING_SERVICE in service_types
     assert EVE_HISTORY_SERVICE in service_types, "a vendor UUID must not be truncated"
+
+
+def test_the_pairings_characteristic_is_reachable_within_the_bounded_read():
+    """The bound exists so a pairing operation does not wait out a full walk.
+    On real firmware the Pairings characteristic sits well inside it."""
+    database = _database()
+
+    char = database.accessories[0].find_service_characteristic_by_type(
+        PAIRING_SERVICE, PAIRINGS_CHARACTERISTIC
+    )
+    assert char is not None
+    assert char.instance_id <= PAIRING_SERVICE_MAX_IID
 
 
 def test_the_walk_bounds_cover_this_accessory():

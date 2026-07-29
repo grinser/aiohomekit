@@ -210,7 +210,7 @@ async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
     """
     conn = _connection({}, gatt_error=AccessoryDisconnectedError)
 
-    async def failing_walk():
+    async def failing_walk(max_iid):
         raise AccessoryDisconnectedError("walk died")
 
     conn._signature_walk = failing_walk
