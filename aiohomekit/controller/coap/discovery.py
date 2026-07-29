@@ -61,7 +61,13 @@ class CoAPDiscovery(ZeroconfDiscovery):
             pairing["AccessoryPort"] = self.description.port
             pairing["Connection"] = "CoAP"
 
-            obj = self.controller.pairings[alias] = CoAPPairing(self.controller, pairing)
+            # The description has to be handed over here: finish_pairing
+            # builds the pairing itself, and get_primary_name -- called by the
+            # controller immediately after this returns -- needs the advertised
+            # name so it does not have to enumerate to answer.
+            obj = self.controller.pairings[alias] = CoAPPairing(
+                self.controller, pairing, description=self.description
+            )
 
             return obj
 

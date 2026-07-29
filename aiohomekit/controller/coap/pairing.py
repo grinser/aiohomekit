@@ -28,7 +28,7 @@ from aiohomekit.model.characteristics import CharacteristicPermissions
 from aiohomekit.protocol.statuscodes import HapStatusCode
 from aiohomekit.utils import async_create_task
 from aiohomekit.uuid import normalize_uuid
-from aiohomekit.zeroconf import ZeroconfPairing
+from aiohomekit.zeroconf import HomeKitService, ZeroconfPairing
 
 from .connection import CoAPHomeKitConnection
 
@@ -36,13 +36,25 @@ logger = logging.getLogger(__name__)
 
 
 class CoAPPairing(ZeroconfPairing):
-    def __init__(self, controller: AbstractController, pairing_data: AbstractPairingData) -> None:
+    def __init__(
+        self,
+        controller: AbstractController,
+        pairing_data: AbstractPairingData,
+        description: HomeKitService | None = None,
+    ) -> None:
         self.connection = CoAPHomeKitConnection(
             self, pairing_data["AccessoryIP"], pairing_data["AccessoryPort"]
         )
         self.connection_future = None
         self.connection_lock = asyncio.Condition()
         self.pairing_data = pairing_data
+        # Assigned directly, and before super().__init__, exactly as
+        # BlePairing does it: AbstractPairing never touches self.description,
+        # and routing it through _async_description_update instead would
+        # schedule _process_config_changed -- the advertised config number
+        # always exceeds our -1 -- so the pairing dialog would enumerate after
+        # all, which is the thing having a description here avoids.
+        self.description = description
 
         super().__init__(controller, pairing_data)
 
@@ -148,16 +160,79 @@ class CoAPPairing(ZeroconfPairing):
                 for characteristic in service["characteristics"]:
                     characteristic["type"] = normalize_uuid(characteristic["type"])
 
-        self._accessories_state = AccessoriesState(Accessories.from_list(accessories), self.config_num or 0)
-        self._update_accessories_state_cache()
+        if self.connection.database_is_partial:
+            # The walk was cut short. Usable now, but persisting it would survive
+            # a restart and be indistinguishable from a complete read. In memory
+            # it stays at -1 so the next description update retries the read; a
+            # cut-short walk is transient, so the retry is expected to complete.
+            logger.debug("%s: not caching a truncated accessory database", self.name)
+            self._accessories_state = AccessoriesState(Accessories.from_list(accessories), -1)
+        elif self.connection.database_from_walk:
+            # A walk infers the end of the database from a run of missing
+            # instance ids, so it cannot prove it saw everything. In memory it
+            # lives under the real config number -- at -1 every description
+            # update would look like a config change, and a state-number bump
+            # (which sleepy accessories send for every event) would trigger a
+            # full re-walk instead of the catch-up poll. But it is *persisted*
+            # under -1, a config number no advertisement carries, so a restart
+            # restores entities from it and the first description update
+            # re-reads for real.
+            config_num = self.description.config_num if self.description else max(self.config_num, 0)
+            self._accessories_state = AccessoriesState(Accessories.from_list(accessories), config_num)
+            logger.debug("%s: caching the signature-walk database as always-stale", self.name)
+            self.controller._char_cache.async_create_or_update_map(
+                self.id, -1, self.accessories.serialize(), None, None
+            )
+        else:
+            # max(..., 0): with no prior state config_num reports -1, which is
+            # reserved above as the walk's always-stale marker; an authoritative
+            # read must not be cached under it.
+            self._accessories_state = AccessoriesState(
+                Accessories.from_list(accessories), max(self.config_num, 0)
+            )
+            self._update_accessories_state_cache()
+
         return accessories
+
+    async def get_primary_name(self) -> str:
+        """Return the primary name of the device without enumerating it.
+
+        Overrides the default, which reads the whole accessory database. This runs
+        immediately after pairing, and on an accessory that does not implement the
+        0x09 bulk read, enumerating means one request per instance id -- a walk
+        that outlasts a controller's pairing dialog. Failing here loses the
+        pairing while the accessory keeps it, leaving an orphan only a factory
+        reset can clear.
+
+        Zeroconf already told us the name, so use it and leave the database to be
+        read later, off the dialog. Mirrors BlePairing.get_primary_name, which
+        exists for the same reason.
+        """
+        # An empty Accessories() is truthy, so testing `not self.accessories`
+        # alone would send a second call into the default implementation, where
+        # the placeholder's empty list raises instead of enumerating.
+        if self.description and (self.accessories is None or not list(self.accessories)):
+            self._accessories_state = AccessoriesState(Accessories(), -1)
+            return self.description.name
+        return await super().get_primary_name()
 
     async def _process_config_changed(self, config_num: int) -> None:
         """Process a config change.
 
         This method is called when the config num changes.
         """
+        # The instance ids may have moved, so the cached database cannot be reused.
+        self.connection.invalidate_database()
         await self.list_accessories_and_characteristics()
+        if self.connection.database_is_partial or self.connection.database_from_walk:
+            # list_accessories_and_characteristics just declined to persist this
+            # database as authoritative; stamping the accessory's real config
+            # number here would overrule that and persist it as one. Listeners
+            # still hear the change, and the stale marker makes the next
+            # comparison re-read for real.
+            for callback in self.config_changed_listeners:
+                callback(self.config_num)
+            return
         self._accessories_state = AccessoriesState(self._accessories_state.accessories, config_num)
         self._callback_and_save_config_changed(config_num)
 
@@ -175,7 +250,18 @@ class CoAPPairing(ZeroconfPairing):
         This method should try not to fetch all the accessories unless
         we know the config num is out of date or force_update is True
         """
-        if not self.accessories or force_update:
+        # `not self.accessories` alone cannot be trusted: get_primary_name's
+        # placeholder is an empty-but-truthy Accessories(). Its config number of
+        # -1 never matches an advertisement, so the comparison (the same one
+        # BlePairing uses) is what guarantees the deferred first read happens.
+        config_stale = self.description is not None and self.config_num != self.description.config_num
+        if (
+            not self.accessories
+            or not list(self.accessories)
+            or force_update
+            or config_stale
+            or self.connection.database_is_partial
+        ):
             await self.list_accessories_and_characteristics()
 
     async def get_characteristics(

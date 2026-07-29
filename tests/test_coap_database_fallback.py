@@ -16,11 +16,11 @@ from aiocoap.error import Error as AiocoapError
 
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import (
-    _WALK_EXPECTED_STATUSES,
     DEFAULT_POST_TIMEOUT,
     GATT_PROBE_TIMEOUT,
     SIGNATURE_WALK_MAX_IID,
     SIGNATURE_WALK_MAX_MISSES,
+    _WALK_EXPECTED_STATUSES,
     CoAPHomeKitConnection,
 )
 from aiohomekit.controller.coap.pdu import OpCode, PDUStatus
@@ -210,7 +210,7 @@ async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
     """
     conn = _connection({}, gatt_error=AccessoryDisconnectedError)
 
-    async def failing_walk(max_iid=SIGNATURE_WALK_MAX_IID):
+    async def failing_walk():
         raise AccessoryDisconnectedError("walk died")
 
     conn._signature_walk = failing_walk
@@ -448,3 +448,70 @@ async def test_connect_does_not_verify_again_over_a_restored_session():
     await asyncio.gather(conn._reverify_session(), conn.connect({"AccessoryPairingID": "x"}))
 
     assert verifies == 1, "the session was already up by the time connect() got the lock"
+
+
+async def test_a_reconnect_reuses_a_known_good_database():
+    """Re-walking on every reconnect costs ~300 sequential requests on an
+    accessory that drops 0x09 -- more than the poll interval, on battery power."""
+    conn = _connection(DEVICE)
+
+    await conn.get_accessory_info()
+    walked_first = list(conn.enc_ctx.walked_iids)
+    conn.enc_ctx.walked_iids.clear()
+
+    await conn.get_accessory_info()
+
+    assert walked_first, "the first enumeration must actually walk"
+    assert conn.enc_ctx.walked_iids == [], "the second must reuse, not re-walk"
+    assert _chars(conn.info) == [2, 3, 15]
+
+
+async def test_a_truncated_database_is_not_reused():
+    conn = _connection(DEVICE)
+    await conn.get_accessory_info()
+    conn.database_is_partial = True
+    conn.enc_ctx.walked_iids.clear()
+
+    await conn.get_accessory_info()
+
+    assert conn.enc_ctx.walked_iids, "a truncated database must be re-read"
+
+
+async def test_invalidating_the_database_forces_a_re_read():
+    conn = _connection(DEVICE)
+    await conn.get_accessory_info()
+    conn.invalidate_database()
+    conn.enc_ctx.walked_iids.clear()
+
+    await conn.get_accessory_info()
+
+    assert conn.enc_ctx.walked_iids, "a config change must force a fresh walk"
+
+
+async def test_a_bulk_read_database_is_not_reused_across_enumerations():
+    """Reuse is for walk databases only. An accessory that answers 0x09 keeps
+    the pre-fallback behaviour -- one cheap bulk read per enumeration -- so
+    nothing changes for it, including picking up a database edit that was not
+    accompanied by a config-number bump."""
+    stub = CoAPHomeKitConnection.__new__(CoAPHomeKitConnection)
+    encoded = CoAPHomeKitConnection._database_from_signatures(stub, DEVICE).encode()
+    conn = _connection(DEVICE, gatt_error=None, gatt_body=encoded)
+
+    await conn.get_accessory_info()
+    await conn.get_accessory_info()
+
+    assert conn.enc_ctx.probes == 2, "0x09 must be re-read on every enumeration"
+
+
+async def test_a_walk_derived_database_is_flagged_as_such():
+    """It cannot prove it saw the whole accessory, so it must be distinguishable
+    from a 0x09 read that can."""
+    conn = _connection(DEVICE)
+    await conn._read_gatt_database()
+    assert conn.database_from_walk
+
+    stub = CoAPHomeKitConnection.__new__(CoAPHomeKitConnection)
+    encoded = CoAPHomeKitConnection._database_from_signatures(stub, DEVICE).encode()
+    bulk = _connection(DEVICE, gatt_error=None, gatt_body=encoded)
+    await bulk._read_gatt_database()
+    assert not bulk.database_from_walk

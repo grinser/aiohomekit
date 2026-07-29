@@ -1,0 +1,163 @@
+"""What may be written to the persistent accessory cache, and under which config
+number.
+
+A signature walk infers the end of the database from a run of missing instance
+ids. That is a guess, and on a sparsely numbered accessory it is wrong -- real
+CoAP databases in this repo's fixtures run to instance id 64087 with gaps of
+43515. A walk-derived database is therefore usable but never authoritative, and
+must not be able to suppress a later real read -- on any path, including the
+config-changed one.
+"""
+
+from aiohomekit.controller.coap.pairing import CoAPPairing
+from aiohomekit.model import Accessories, AccessoriesState
+
+ACCESSORY = [
+    {
+        "aid": 1,
+        "services": [
+            {
+                "iid": 1,
+                "type": "3E",
+                "characteristics": [{"iid": 2, "type": "23", "perms": ["pr"], "format": "string"}],
+            }
+        ],
+    }
+]
+
+
+class FakeConnection:
+    address = "[::1]:5683"
+
+    def __init__(self, partial=False, from_walk=False):
+        self.database_is_partial = partial
+        self.database_from_walk = from_walk
+        self.invalidated = False
+
+    async def get_accessory_info(self):
+        import copy
+
+        return copy.deepcopy(ACCESSORY)
+
+    def invalidate_database(self):
+        self.invalidated = True
+
+
+class FakeCharCache:
+    def __init__(self):
+        self.persisted = []
+
+    def async_create_or_update_map(self, pairing_id, config_num, accessories, *args, **kwargs):
+        self.persisted.append(config_num)
+
+
+def _pairing(prior_config_num=None, advertised_config_num=None, **kwargs):
+    pairing = CoAPPairing.__new__(CoAPPairing)
+    pairing.id = "AA:BB:CC:DD:EE:FF"
+    pairing._accessories_state = None
+    if prior_config_num is not None:
+        # config_num reports -1 with no prior state, so a first read is stale by
+        # construction whatever its provenance; give it a real one to tell the
+        # authoritative and always-stale paths apart.
+        pairing._accessories_state = AccessoriesState(Accessories(), prior_config_num)
+    pairing.connection = FakeConnection(**kwargs)
+    pairing.description = None
+    if advertised_config_num is not None:
+        pairing.description = type(
+            "Description", (), {"config_num": advertised_config_num, "name": "Eve Room 4B8F"}
+        )()
+    pairing.controller = type("Controller", (), {"_char_cache": FakeCharCache()})()
+    pairing.config_changed_listeners = set()
+
+    # *args: _ensure_connected grows a pair_verify_attempts argument in the
+    # pair-verify retry change; accept it either way so the two compose.
+    async def _connected(*args, **kwargs):
+        return None
+
+    pairing._ensure_connected = _connected
+    return pairing
+
+
+def _persisted(pairing):
+    return pairing.controller._char_cache.persisted
+
+
+async def test_a_bulk_read_database_is_cached_under_the_real_config_number():
+    pairing = _pairing(prior_config_num=2)
+
+    await pairing.list_accessories_and_characteristics()
+
+    assert _persisted(pairing) == [2], "0x09 read the whole database; it is authoritative"
+
+
+async def test_a_first_bulk_read_is_not_cached_under_the_stale_marker():
+    """With no prior state config_num reports -1, which is reserved for walk
+    databases; an authoritative read must never be persisted under it."""
+    pairing = _pairing()
+
+    await pairing.list_accessories_and_characteristics()
+
+    assert _persisted(pairing) == [0]
+    assert pairing._accessories_state.config_num == 0
+
+
+async def test_a_walk_database_is_persisted_as_always_stale_but_live_under_the_real_config():
+    """Persisted under -1: a restart restores entities from it, and the first
+    description update re-reads because no advertisement carries -1. In memory
+    under the advertised config number: a state-number bump must keep looking
+    like an event (catch-up poll), not a config change that re-walks."""
+    pairing = _pairing(prior_config_num=2, advertised_config_num=5, from_walk=True)
+
+    await pairing.list_accessories_and_characteristics()
+
+    assert _persisted(pairing) == [-1]
+    assert pairing._accessories_state.config_num == 5
+
+
+async def test_a_truncated_database_is_not_cached_at_all():
+    pairing = _pairing(partial=True, from_walk=True)
+
+    await pairing.list_accessories_and_characteristics()
+
+    assert _persisted(pairing) == [], "a database known to be cut short must not persist"
+    assert pairing._accessories_state is not None, "but it stays usable in memory"
+    assert pairing._accessories_state.config_num == -1, "and stays stale so the read is retried"
+
+
+async def test_a_config_change_cannot_persist_a_walk_database_as_authoritative():
+    """The config-changed path re-reads and then saves. For a walk database the
+    save must not run: it would overwrite the always-stale marker with the
+    accessory's real config number, and after a restart the walk database would
+    be indistinguishable from a complete read."""
+    pairing = _pairing(prior_config_num=2, advertised_config_num=7, from_walk=True)
+    heard = []
+    pairing.config_changed_listeners = {heard.append}
+
+    await pairing._process_config_changed(7)
+
+    assert pairing.connection.invalidated, "the old database must not be reused"
+    assert _persisted(pairing) == [-1], "persisted only by the walk branch, never as authoritative"
+    assert heard == [7], "listeners still hear the config change"
+
+
+async def test_a_config_change_cannot_persist_a_truncated_database_at_all():
+    pairing = _pairing(prior_config_num=2, advertised_config_num=7, from_walk=True, partial=True)
+    heard = []
+    pairing.config_changed_listeners = {heard.append}
+
+    await pairing._process_config_changed(7)
+
+    assert _persisted(pairing) == []
+    assert heard == [-1], "the state stays stale, and listeners see that"
+
+
+async def test_a_config_change_with_a_bulk_read_persists_normally():
+    pairing = _pairing(prior_config_num=2, advertised_config_num=7)
+    heard = []
+    pairing.config_changed_listeners = {heard.append}
+
+    await pairing._process_config_changed(7)
+
+    assert _persisted(pairing) == [2, 7], "the re-read, then the config-changed save"
+    assert pairing._accessories_state.config_num == 7
+    assert heard == [7]

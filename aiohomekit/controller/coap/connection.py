@@ -308,6 +308,7 @@ class CoAPHomeKitConnection:
         self.address = f"[{host}]:{port}"
         self.connection_lock = asyncio.Lock()
         self.enc_ctx = None
+        self.info = None
         self.owner = owner
         self.pair_setup_client = None
         self._pairing_data = None
@@ -322,9 +323,15 @@ class CoAPHomeKitConnection:
         # (config-entry setup and a config-changed notification), and a walk makes
         # that window ~300 round-trips wide instead of one.
         self._enumeration_lock = asyncio.Lock()
-        # Set when a bounded walk described only part of the accessory. Never set
-        # when 0x09 answered, which returns the whole database regardless.
+        # Set when the walk stopped on the miss counter or ran out of range, i.e.
+        # whenever the database was rebuilt rather than read in one request.
         self.database_is_partial = False
+        # True when the database came from a signature walk. A walk infers the end
+        # of the database from a run of missing instance ids, which is a guess: an
+        # accessory numbered sparsely (real CoAP dumps in this repo's fixtures run
+        # to iid 64087 with gaps of 43515) looks finished long before it is. Such a
+        # database is usable but must never be trusted as authoritative.
+        self.database_from_walk = False
 
     async def reconnect_soon(self):
         if not self.enc_ctx:
@@ -685,8 +692,10 @@ class CoAPHomeKitConnection:
                 try:
                     info = Pdu09Database.decode(body)
                     logger.debug(f"Get accessory info: {info.to_dict()!r}")
-                    # 0x09 returns the whole database; nothing was truncated.
+                    # 0x09 returns the whole database in one request, so unlike a
+                    # walk this is known complete.
                     self.database_is_partial = False
+                    self.database_from_walk = False
                     return info
                 except Exception as exc:
                     # Fall back this time, but 0x09 did respond, so it is not
@@ -723,7 +732,12 @@ class CoAPHomeKitConnection:
         # full walk that ends on the miss counter or the scan limit is truncated
         # too, and must not be published as the whole accessory.
         self.database_is_partial = not walk_complete
+        self.database_from_walk = True
         return info
+
+    def invalidate_database(self) -> None:
+        """Force the next enumeration to re-read rather than reuse."""
+        self.info = None
 
     async def get_accessory_info(self):
         """Read the accessory database and every readable value."""
@@ -734,7 +748,17 @@ class CoAPHomeKitConnection:
             return await self._enumerate()
 
     async def _enumerate(self):
-        self.info = await self._read_gatt_database()
+        if self.info is not None and self.database_from_walk and not self.database_is_partial:
+            # Reuse only what a walk built: instance ids do not change without a
+            # config-number change (which invalidates this via
+            # _process_config_changed), and re-walking on every reconnect would
+            # cost ~300 sequential requests on an accessory that drops 0x09 --
+            # more than the poll interval, on battery power. An accessory that
+            # answers 0x09 keeps re-reading its database on every enumeration,
+            # exactly as before this fallback existed.
+            logger.debug("Reusing the walk-built accessory database; reading values only")
+        else:
+            self.info = await self._read_gatt_database()
 
         # read all values
         for accessory in self.info.accessories:
