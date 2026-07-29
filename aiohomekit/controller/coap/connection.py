@@ -71,6 +71,20 @@ logger = logging.getLogger(__name__)
 REMOVE_PAIRING_M2_TIMEOUT = 4.0
 
 DEFAULT_POST_TIMEOUT = 16.0
+# A sleepy accessory frequently misses the first pair-verify. Retrying matters
+# most immediately after pair-setup, where giving up discards a pairing the
+# accessory has already committed to -- an orphan only a factory reset clears.
+#
+# It is not free: an attempt is two messages under an 8 s timeout apiece, so
+# three attempts plus 2+4 s of backoff can hold connection_lock for tens of
+# seconds against an accessory that is simply not there (~22 s measured on a
+# flat-battery Eve). So the full budget is spent only when the caller asks for
+# it -- see CoAPPairing._ensure_connected -- and every other path, including
+# every poll, makes a single attempt.
+PAIR_VERIFY_ATTEMPTS = 3
+PAIR_VERIFY_RETRY_DELAY = 2.0
+# A deterministic rejection will not become a success on the third try.
+_PAIR_VERIFY_FATAL: tuple[type[BaseException], ...] = (AuthenticationError,)
 # A probe that times out latches 0x09 off for the life of the connection, so this
 # must stay at least as generous as post_bytes' default: an accessory that answers
 # a large database slowly is supported, not broken.
@@ -483,24 +497,51 @@ class CoAPHomeKitConnection:
 
         return True
 
-    async def connect(self, pairing_data, enumerate_database: bool = True):
+    async def connect(self, pairing_data, attempts: int = 1, enumerate_database: bool = True):
+        """Establish a session, retrying pair-verify `attempts` times.
+
+        The caller decides the budget because only the caller knows what is at
+        stake: a battery-powered Thread accessory routinely misses the first
+        pair-verify, and the worst moment to give up is right after pair-setup,
+        where the accessory has committed a pairing and abandoning it discards
+        credentials only a factory reset can clear. A poll has no such stake,
+        and its caller will try again anyway.
+
+        `enumerate_database` is False for pairing operations, which locate the
+        one characteristic they need themselves.
+        """
         async with self.connection_lock:
             if self.is_connected:
                 logger.debug("Already connected")
                 return
 
-            try:
-                async with self._verify_lock:
-                    # Re-check under the lock: another task may have established
-                    # the session while we waited, and verifying again would shut
-                    # its context down and replace it.
-                    if not self.is_connected:
-                        await self.do_pair_verify(pairing_data)
-            except asyncio.TimeoutError:
-                logger.debug("Pair verify timed out")
-                raise AccessoryDisconnectedError("Pair verify timed out")
-            except Exception as exc:
-                logger.debug("Pair verify failed", exc_info=exc)
+            attempts = max(1, attempts)
+            last_exc: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    async with self._verify_lock:
+                        # Re-check under the lock: another task may have
+                        # established the session while we waited, and verifying
+                        # again would shut its context down and replace it.
+                        if not self.is_connected:
+                            await self.do_pair_verify(pairing_data)
+                    break
+                except _PAIR_VERIFY_FATAL as exc:
+                    # A removed pairing or factory-reset accessory rejects every
+                    # attempt the same way; retrying only stalls the caller.
+                    logger.debug("Pair verify rejected", exc_info=exc)
+                    raise AccessoryDisconnectedError("Pair verify failed")
+                except asyncio.TimeoutError as exc:
+                    last_exc = exc
+                    logger.debug("Pair verify timed out (attempt %d/%d)", attempt, attempts)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.debug("Pair verify failed (attempt %d/%d)", attempt, attempts, exc_info=exc)
+                if attempt < attempts:
+                    await asyncio.sleep(PAIR_VERIFY_RETRY_DELAY * attempt)
+            else:
+                if isinstance(last_exc, asyncio.TimeoutError):
+                    raise AccessoryDisconnectedError("Pair verify timed out")
                 raise AccessoryDisconnectedError("Pair verify failed")
 
             if enumerate_database:

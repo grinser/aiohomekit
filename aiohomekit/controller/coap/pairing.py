@@ -30,7 +30,7 @@ from aiohomekit.utils import async_create_task
 from aiohomekit.uuid import normalize_uuid
 from aiohomekit.zeroconf import HomeKitService, ZeroconfPairing
 
-from .connection import CoAPHomeKitConnection
+from .connection import PAIR_VERIFY_ATTEMPTS, CoAPHomeKitConnection
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,17 @@ class CoAPPairing(ZeroconfPairing):
         """Returns how often the device should be polled."""
         return timedelta(minutes=1)
 
-    async def _ensure_connected(self, enumerate_database: bool = True):
+    async def _ensure_connected(
+        self, pair_verify_attempts: int = 1, enumerate_database: bool = True
+    ):
         """Connect if needed.
+
+        `pair_verify_attempts` is the retry budget handed to the connection.
+        It defaults to a single attempt: on an accessory that is not answering,
+        each extra attempt holds connection_lock for another timeout, and every
+        caller here is either a poll or a read that its own caller will retry.
+        Only an interactive setup raises it -- see
+        async_populate_accessories_state.
 
         `enumerate_database` is False for pairing operations, which need one
         characteristic and locate it themselves. Enumerating on their behalf is
@@ -109,7 +118,9 @@ class CoAPPairing(ZeroconfPairing):
             if self.connection_future is None:
                 # start a connection but don't await it here
                 self.connection_future = self.connection.connect(
-                    self.pairing_data, enumerate_database=enumerate_database
+                    self.pairing_data,
+                    attempts=pair_verify_attempts,
+                    enumerate_database=enumerate_database,
                 )
             else:
                 # we'll wait on the primary coroutine & copy how it returns
@@ -157,8 +168,10 @@ class CoAPPairing(ZeroconfPairing):
         await self._ensure_connected()
         return await self.connection.do_identify()
 
-    async def list_accessories_and_characteristics(self) -> list[dict[str, Any]]:
-        await self._ensure_connected()
+    async def list_accessories_and_characteristics(
+        self, pair_verify_attempts: int = 1
+    ) -> list[dict[str, Any]]:
+        await self._ensure_connected(pair_verify_attempts)
 
         accessories = await self.connection.get_accessory_info()
 
@@ -259,6 +272,12 @@ class CoAPPairing(ZeroconfPairing):
         This method should try not to fetch all the accessories unless
         we know the config num is out of date or force_update is True
         """
+        # `attempts` is how the controller says whether it is in a hurry: it is
+        # 1 while Home Assistant is still starting up, and None once it is
+        # running -- which is when a device has just been paired and losing the
+        # session would orphan the pairing on the accessory. That is the one
+        # place worth spending the full pair-verify budget.
+        pair_verify_attempts = PAIR_VERIFY_ATTEMPTS if attempts is None else max(1, attempts)
         # `not self.accessories` alone cannot be trusted: get_primary_name's
         # placeholder is an empty-but-truthy Accessories(). Its config number of
         # -1 never matches an advertisement, so the comparison (the same one
@@ -271,8 +290,7 @@ class CoAPPairing(ZeroconfPairing):
             or config_stale
             or self.connection.database_is_partial
         ):
-            await self.list_accessories_and_characteristics()
-
+            await self.list_accessories_and_characteristics(pair_verify_attempts)
     async def get_characteristics(
         self,
         characteristics: Iterable[tuple[int, int]],
