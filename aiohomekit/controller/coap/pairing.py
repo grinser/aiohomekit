@@ -291,6 +291,7 @@ class CoAPPairing(ZeroconfPairing):
             or self.connection.database_is_partial
         ):
             await self.list_accessories_and_characteristics(pair_verify_attempts)
+
     async def get_characteristics(
         self,
         characteristics: Iterable[tuple[int, int]],
