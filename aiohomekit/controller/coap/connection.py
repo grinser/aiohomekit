@@ -132,13 +132,21 @@ def _shorten_type(type_: int) -> int:
     return type_
 
 
-# How a dropped 0x09 surfaces: no reply at all, a 404 whose response then fails
-# to decrypt, or the transport being torn down mid-request.
+# A fault in *this session*, not evidence about the accessory. The status branch
+# already draws that distinction -- busy or desynced is not "unsupported" -- and
+# the exception branch has to agree: _gatt_unsupported is never cleared, so
+# latching here would downgrade a capable accessory to a 300-request walk for
+# the life of the connection on the strength of one bad decrypt.
+_PROBE_TRANSIENT_FAILURES: tuple[type[BaseException], ...] = (
+    EncryptionError,
+    AiocoapError,
+)
+
+# How a dropped 0x09 surfaces: no reply at all, or a reply too short or garbled
+# to be a PDU at all.
 _PROBE_FAILURES: tuple[type[BaseException], ...] = (
     AccessoryDisconnectedError,
-    EncryptionError,
     asyncio.TimeoutError,
-    AiocoapError,
     # decode_pdu unpacks the header and builds a PDUStatus outside any try, so a
     # short or garbage reply surfaces as one of these rather than a status.
     struct.error,
@@ -311,7 +319,11 @@ class EventResource(resource.Resource):
             _, iid, body_len = struct.unpack("<BHH", payload[offset : offset + 5])
             body = payload[offset + 5 : offset + 5 + body_len]
 
-            characteristic = self.connection.info.find_characteristic_by_iid(iid)
+            # info is None on a session raised for a pairing operation, which
+            # skips enumeration by design. Events can still arrive on it, so the
+            # value is reported undecoded rather than taken as an AttributeError.
+            info = self.connection.info
+            characteristic = info.find_characteristic_by_iid(iid) if info is not None else None
             value = decode_pdu_03(body) if body_len > 0 else b""
             if characteristic is not None and body_len > 0:
                 characteristic.raw_value = value
@@ -513,36 +525,8 @@ class CoAPHomeKitConnection:
         async with self.connection_lock:
             if self.is_connected:
                 logger.debug("Already connected")
-                return
-
-            attempts = max(1, attempts)
-            last_exc: Exception | None = None
-            for attempt in range(1, attempts + 1):
-                try:
-                    async with self._verify_lock:
-                        # Re-check under the lock: another task may have
-                        # established the session while we waited, and verifying
-                        # again would shut its context down and replace it.
-                        if not self.is_connected:
-                            await self.do_pair_verify(pairing_data)
-                    break
-                except _PAIR_VERIFY_FATAL as exc:
-                    # A removed pairing or factory-reset accessory rejects every
-                    # attempt the same way; retrying only stalls the caller.
-                    logger.debug("Pair verify rejected", exc_info=exc)
-                    raise AccessoryDisconnectedError("Pair verify failed")
-                except asyncio.TimeoutError as exc:
-                    last_exc = exc
-                    logger.debug("Pair verify timed out (attempt %d/%d)", attempt, attempts)
-                except Exception as exc:
-                    last_exc = exc
-                    logger.debug("Pair verify failed (attempt %d/%d)", attempt, attempts, exc_info=exc)
-                if attempt < attempts:
-                    await asyncio.sleep(PAIR_VERIFY_RETRY_DELAY * attempt)
             else:
-                if isinstance(last_exc, asyncio.TimeoutError):
-                    raise AccessoryDisconnectedError("Pair verify timed out")
-                raise AccessoryDisconnectedError("Pair verify failed")
+                await self._verify_with_retries(pairing_data, attempts)
 
             if enumerate_database:
                 # Needed to read/write characteristics -- but a pairing
@@ -552,27 +536,72 @@ class CoAPHomeKitConnection:
                 # an Eve Room: a cold remove_pairing spent 20 s on the 0x09
                 # probe and 23 s in the walk this call started, and was
                 # cancelled 0.3 s before the walk would have finished.
-                await self.get_accessory_info()
+                #
+                # Reached even when the session was already up, because a
+                # session established for a pairing operation deliberately has
+                # no database behind it, and the caller that asked to enumerate
+                # is about to dereference one.
+                await self.get_accessory_info(verify_attempts=attempts)
 
             return
+
+    async def _verify_with_retries(self, pairing_data, attempts: int) -> None:
+        """Run pair-verify, retrying up to `attempts` times.
+
+        Shared by connect() and _reverify_session so both honour the same
+        budget. The re-verify a dropped 0x09 forces is against an accessory that
+        has just demonstrated it sleeps through pair-verifies, so leaving that
+        one an implicit budget of a single attempt would spend the caller's
+        budget everywhere except the place most likely to need it.
+        """
+        attempts = max(1, attempts)
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self._verify_lock:
+                    # Re-check under the lock: another task may have established
+                    # the session while we waited, and verifying again would
+                    # shut its context down and replace it.
+                    if not self.is_connected:
+                        await self.do_pair_verify(pairing_data)
+                return
+            except _PAIR_VERIFY_FATAL as exc:
+                # A removed pairing or factory-reset accessory rejects every
+                # attempt the same way; retrying only stalls the caller.
+                logger.debug("Pair verify rejected", exc_info=exc)
+                raise AccessoryDisconnectedError("Pair verify failed")
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                logger.debug("Pair verify timed out (attempt %d/%d)", attempt, attempts)
+            except Exception as exc:
+                last_exc = exc
+                logger.debug("Pair verify failed (attempt %d/%d)", attempt, attempts, exc_info=exc)
+            if attempt < attempts:
+                await asyncio.sleep(PAIR_VERIFY_RETRY_DELAY * attempt)
+
+        if isinstance(last_exc, asyncio.TimeoutError):
+            raise AccessoryDisconnectedError("Pair verify timed out")
+        raise AccessoryDisconnectedError("Pair verify failed")
 
     @property
     def is_connected(self):
         return self.enc_ctx is not None and self.enc_ctx.coap_ctx is not None
 
-    async def _reverify_session(self) -> None:
+    async def _reverify_session(self, attempts: int = 1) -> None:
         """Re-establish a session a dropped 0x09 tore down.
 
         Serialised against connect(): both run pair-verify and both assign
         enc_ctx, so without this one of the two sessions is left unreferenced,
         leaking a socket and a session slot on an accessory that has few.
+
+        `attempts` is the budget the original caller asked for; see
+        _verify_with_retries.
         """
-        async with self._verify_lock:
-            if self.is_connected:
-                return
-            if self._pairing_data is None:
-                raise AccessoryDisconnectedError("Cannot re-establish session: pairing data unavailable")
-            await self.do_pair_verify(self._pairing_data)
+        if self.is_connected:
+            return
+        if self._pairing_data is None:
+            raise AccessoryDisconnectedError("Cannot re-establish session: pairing data unavailable")
+        await self._verify_with_retries(self._pairing_data, attempts)
 
     async def _signature_walk(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> tuple[dict[int, bytes], bool]:
         """Enumerate the accessory database by reading each characteristic's
@@ -732,60 +761,80 @@ class CoAPHomeKitConnection:
             aid += 1
         return Pdu09Database(_accessories=containers)
 
-    async def _read_gatt_database(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> Pdu09Database:
-        """Read the accessory database. Prefer the 0x09 bulk read; if the
-        accessory does not implement it, rebuild from signature reads.
+    async def _probe_gatt_database(
+        self, *, timeout: float, may_latch: bool, verify_attempts: int = 1
+    ) -> Pdu09Database | None:
+        """Try the 0x09 bulk read; return the database, or None to walk instead.
 
-        Some Thread accessories (e.g. Eve Room, HA #167379) silently drop 0x09
-        *and* tear down the secured session, so on a 0x09 timeout we must
-        re-establish the session (pair-verify) before reading another way. Once
-        an accessory is known not to answer 0x09 the probe is skipped entirely on
-        later reads, avoiding both its timeout and the teardown it causes.
+        Leaves a live session behind either way. Some Thread accessories (e.g.
+        Eve Room, HA #167379) silently drop 0x09 *and* tear down the secured
+        session, so whatever reads next has to pair-verify again first.
+
+        `may_latch` says whether a failure here is admissible evidence that the
+        accessory has no 0x09 at all. It is False whenever the probe was given
+        less than GATT_PROBE_TIMEOUT: a window sized to the caller's deadline
+        proves nothing about the accessory, and since _gatt_unsupported is never
+        cleared, latching on it would condemn an accessory that merely answers
+        slowly to a 300-request walk for the life of the connection.
         """
+        if self._gatt_unsupported:
+            return None
+
         session_alive = True
         body = None
-        if not self._gatt_unsupported:
-            try:
-                probe_timeout = (
-                    GATT_PROBE_TIMEOUT if max_iid == SIGNATURE_WALK_MAX_IID else PAIRING_PROBE_TIMEOUT
-                )
-                _, body = await self.enc_ctx.post(
-                    OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=probe_timeout
-                )
-            except _PROBE_FAILURES:
-                # No reply at all is the signature of firmware that drops 0x09.
-                logger.debug("0x09 not answered; will reconnect and rebuild without it")
-                session_alive = False
+        try:
+            _, body = await self.enc_ctx.post(OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=timeout)
+        except _PROBE_TRANSIENT_FAILURES:
+            logger.debug("0x09 probe failed transiently; rebuilding without it this time")
+            session_alive = False
+        except _PROBE_FAILURES:
+            # No reply at all is the signature of firmware that drops 0x09.
+            logger.debug("0x09 not answered; will reconnect and rebuild without it")
+            session_alive = False
+            if may_latch:
                 self._gatt_unsupported = True
 
-            if isinstance(body, (bytes, bytearray)):
-                try:
-                    info = Pdu09Database.decode(body)
-                    logger.debug(f"Get accessory info: {info.to_dict()!r}")
-                    # 0x09 returns the whole database in one request, so unlike a
-                    # walk this is known complete.
-                    self.database_is_partial = False
-                    self.database_from_walk = False
+        if isinstance(body, (bytes, bytearray)):
+            try:
+                info = Pdu09Database.decode(body)
+                logger.debug(f"Get accessory info: {info.to_dict()!r}")
+                if info.accessories:
                     return info
-                except Exception as exc:
-                    # Fall back this time, but 0x09 did respond, so it is not
-                    # remembered as unsupported.
-                    logger.error(f"TLV decode failed: {body.hex()}", exc_info=exc)
-            elif body is not None:
-                # A status: the session is healthy. Only a definitive rejection
-                # means the accessory lacks 0x09 -- busy or desynced is transient,
-                # and latching on it would downgrade a capable accessory to a
-                # 300-request walk for the life of the connection.
-                logger.debug("0x09 returned status %r; rebuilding without it", body)
-                if body in _GATT_UNSUPPORTED_STATUSES:
-                    self._gatt_unsupported = True
+                # Decoded, but there is nothing in it. Callers index
+                # accessories[0], and the controller would cache this as a valid
+                # accessory that simply has no characteristics.
+                logger.debug("0x09 returned an empty database; rebuilding without it")
+            except Exception as exc:
+                # Fall back this time, but 0x09 did respond, so it is not
+                # remembered as unsupported.
+                logger.error(f"TLV decode failed: {body.hex()}", exc_info=exc)
+        elif body is not None:
+            # A status: the session is healthy. Only a definitive rejection
+            # means the accessory lacks 0x09 -- busy or desynced is transient.
+            logger.debug("0x09 returned status %r; rebuilding without it", body)
+            if may_latch and body in _GATT_UNSUPPORTED_STATUSES:
+                self._gatt_unsupported = True
 
         if not session_alive:
             # The walk and the value reads that follow need a live session.
-            await self._reverify_session()
+            await self._reverify_session(verify_attempts)
+        return None
+
+    async def _read_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database:
+        """Read the whole accessory database, by 0x09 if the accessory has it
+        and by signature walk if it does not."""
+        info = await self._probe_gatt_database(
+            timeout=GATT_PROBE_TIMEOUT, may_latch=True, verify_attempts=verify_attempts
+        )
+        if info is not None:
+            # 0x09 returns the whole database in one request, so unlike a walk
+            # this is known complete.
+            self.database_is_partial = False
+            self.database_from_walk = False
+            return info
 
         logger.debug("Rebuilding accessory database via signature reads")
-        signatures, walk_complete = await self._signature_walk(max_iid)
+        signatures, walk_complete = await self._signature_walk()
         if not signatures:
             raise AccessoryDisconnectedError("Unable to parse accessory database")
         logger.debug("Signature walk found %d characteristics: %s", len(signatures), sorted(signatures))
@@ -798,11 +847,9 @@ class CoAPHomeKitConnection:
                 f"of {len(signatures)} could be decoded"
             )
 
-        # A full walk that ends on the scan limit is truncated; so is *any*
-        # bounded read, even one that ended on the miss counter -- the bound
-        # exists to find one characteristic quickly, and whatever it built must
-        # never be published, cached, or reused as the whole accessory.
-        self.database_is_partial = (not walk_complete) or (max_iid != SIGNATURE_WALK_MAX_IID)
+        # A walk that ends on the scan limit rather than on a long run of gaps
+        # never reached the end of the database.
+        self.database_is_partial = not walk_complete
         self.database_from_walk = True
         return info
 
@@ -810,20 +857,19 @@ class CoAPHomeKitConnection:
         """Force the next enumeration to re-read rather than reuse."""
         self.info = None
 
-    async def get_accessory_info(self, max_iid: int = SIGNATURE_WALK_MAX_IID):
+    async def get_accessory_info(self, verify_attempts: int = 1):
         """Read the accessory database and every readable value.
 
-        `max_iid` bounds a signature walk, should one be needed. It is used only
-        by pairing operations, which need a single characteristic and cannot wait
-        out a full walk; the resulting database is always marked partial.
+        `verify_attempts` is the pair-verify budget to use should the 0x09 probe
+        drop the session; see _verify_with_retries.
         """
         async with self._enumeration_lock:
             if not self.is_connected:
                 # The wait can be long enough for the session to have gone away.
                 raise AccessoryDisconnectedError("Connection lost before enumerating")
-            return await self._enumerate(max_iid)
+            return await self._enumerate(verify_attempts)
 
-    async def _enumerate(self, max_iid: int = SIGNATURE_WALK_MAX_IID):
+    async def _enumerate(self, verify_attempts: int = 1):
         if self.info is not None and self.database_from_walk and not self.database_is_partial:
             # Reuse only what a walk built: instance ids do not change without a
             # config-number change (which invalidates this via
@@ -834,7 +880,7 @@ class CoAPHomeKitConnection:
             # exactly as before this fallback existed.
             logger.debug("Reusing the walk-built accessory database; reading values only")
         else:
-            self.info = await self._read_gatt_database(max_iid)
+            self.info = await self._read_gatt_database(verify_attempts)
 
         # read all values
         for accessory in self.info.accessories:
@@ -1047,23 +1093,48 @@ class CoAPHomeKitConnection:
         pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
         return self._unsubscribe_from_exit(ids, pdu_results)
 
+    async def _lookup_pairings_characteristic(self, max_iid: int, verify_attempts: int = 1):
+        """Find the Pairings characteristic with a read bounded to `max_iid`.
+
+        Deliberately does not go through get_accessory_info, and writes nothing
+        to self.info. Two things follow, and both are the point:
+
+        * It cannot be blocked. get_accessory_info holds the enumeration lock
+          for the length of a full walk, and an unpair that waits that out is
+          abandoned by the controller -- which leaves the pairing orphaned on
+          the accessory, needing a factory reset to clear.
+        * It cannot do damage. The database this builds is truncated by
+          construction, so making it self.info would hand every later read and
+          write a lookup table missing everything above the bound.
+        """
+        database = await self._probe_gatt_database(
+            timeout=PAIRING_PROBE_TIMEOUT, may_latch=False, verify_attempts=verify_attempts
+        )
+        if database is None:
+            signatures, _ = await self._signature_walk(max_iid)
+            if not signatures:
+                return None
+            database = self._database_from_signatures(signatures)
+        if not database.accessories:
+            return None
+        return database.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+
     async def _pairings_characteristic(self):
         """Locate the Pairing service's Pairings characteristic.
 
         Prefers whatever has already been enumerated, then a bounded read, and
-        only then a full one. A full signature walk takes longer than a
-        controller will wait to remove a pairing, and giving up leaves the
-        pairing orphaned on the accessory. Routed through get_accessory_info so
-        the enumeration lock is held: enumerating here directly could clobber a
-        full database another caller was still publishing.
+        only then a full one. HAP lays an accessory's mandatory services out
+        first, so on real firmware the bounded read is the one that answers; the
+        full walk is there for the accessory that numbers them sparsely.
         """
-        for bound in (None, PAIRING_SERVICE_MAX_IID, SIGNATURE_WALK_MAX_IID):
-            if bound is not None:
-                await self.get_accessory_info(bound)
-            if self.info is not None:
-                char = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
-                if char is not None:
-                    return char
+        if self.info is not None and self.info.accessories:
+            char = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+            if char is not None:
+                return char
+        for bound in (PAIRING_SERVICE_MAX_IID, SIGNATURE_WALK_MAX_IID):
+            char = await self._lookup_pairings_characteristic(bound)
+            if char is not None:
+                return char
         raise UnknownError("Accessory exposes no Pairing service")
 
     async def list_pairings(self):

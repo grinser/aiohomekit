@@ -10,6 +10,7 @@ a path the author had not modelled, which per-path tests cannot catch.
 from __future__ import annotations
 
 import asyncio
+import struct
 
 import pytest
 
@@ -26,6 +27,7 @@ from .coap_eve_harness import (
     FakeEve,
     build_connection,
     build_pairing,
+    value_body,
 )
 
 import aiohomekit.controller.coap.connection as connection_module
@@ -46,11 +48,14 @@ async def test_inv1_a_short_probe_may_not_latch_0x09_off():
     """A bounded read gives 0x09 a short window because the caller is in a
     hurry. Latching on that window condemns an accessory that merely answers
     slowly to a 300-request walk for the life of the connection -- which the
-    constant's own comment says must not happen."""
+    constant's own comment says must not happen.
+
+    Driven through remove_pairing, the entry point that actually issues the
+    bounded read, so the invariant is asserted against the real path."""
     eve = FakeEve(gatt="dropped")
     conn = build_connection(eve)
 
-    await conn.get_accessory_info(PAIRING_SERVICE_MAX_IID)
+    assert await conn.remove_pairing("some-controller-id") is True
 
     assert eve.probes == [PAIRING_PROBE_TIMEOUT], "the bounded read must use the short probe"
     assert not conn._gatt_unsupported, (
@@ -132,22 +137,38 @@ async def test_inv4_info_is_present_after_any_successful_ensure_connected():
     assert pairing.connection.info is not None, "a characteristic op would raise AttributeError here"
 
 
+def _iids(database) -> set[int]:
+    return {c.instance_id for a in database.accessories for s in a.services for c in s.characteristics}
+
+
 async def test_inv5_a_bounded_read_never_replaces_the_operating_database():
-    """A bounded read exists to locate one characteristic. Installing its
-    truncated result as connection.info makes it the lookup table for every
-    later read and write."""
+    """A pairing operation must never disturb an enumerated database. The bound
+    (32) sits below the highest characteristic (59), so a truncated database
+    reaching self.info would be detectable as a missing iid."""
     eve = FakeEve()
     conn = build_connection(eve)
 
     await conn.get_accessory_info()
-    full = conn.info
-    full_iids = {c.instance_id for a in full.accessories for s in a.services for c in s.characteristics}
-    assert 59 in full_iids, "precondition: the full walk sees the high sensor"
+    assert 59 in _iids(conn.info), "precondition: the full walk sees the high sensor"
+    before = conn.info
 
-    await conn.get_accessory_info(PAIRING_SERVICE_MAX_IID)
+    assert await conn.remove_pairing("some-controller-id") is True
 
-    kept = {c.instance_id for a in conn.info.accessories for s in a.services for c in s.characteristics}
-    assert 59 in kept, "a bounded read must not downgrade an already-complete database"
+    assert conn.info is before, "a bounded read must not replace the operating database"
+    assert 59 in _iids(conn.info), "a bounded read must not downgrade an already-complete database"
+
+
+async def test_inv5_a_bounded_read_installs_no_database_of_its_own():
+    """The same invariant from the other side: with nothing enumerated yet, a
+    pairing operation must leave self.info untouched rather than installing the
+    truncated database it built to find the one characteristic it needed."""
+    eve = FakeEve()
+    conn = build_connection(eve)
+
+    assert await conn.remove_pairing("some-controller-id") is True
+
+    assert conn.info is None, "the bounded read published its truncated database"
+    assert max(eve.walked) <= PAIRING_SERVICE_MAX_IID, "the read must stop at the bound"
 
 
 # --------------------------------------------------------------------------
@@ -239,27 +260,88 @@ ENTRY_POINTS = [
 ]
 
 
+ENTRY_POINT_ARGS: dict[str, tuple] = {
+    "get_characteristics": ([(1, 2)],),
+    "put_characteristics": ([(1, 2, 1)],),
+    "subscribe": ([(1, 2)],),
+    "unsubscribe": ([(1, 2)],),
+    "remove_pairing": ("some-controller-id",),
+}
+
+
 @pytest.mark.parametrize("entry_point", ENTRY_POINTS)
-async def test_no_entry_point_leaves_a_connected_session_without_a_database(entry_point):
-    """The sweep that would have caught the enumerate_database regression: after
-    any public call, either we are not connected, or info is usable."""
+async def test_no_entry_point_leaves_a_session_that_cannot_be_made_usable(entry_point):
+    """The sweep that would have caught the enumerate_database regression.
+
+    Note what this does *not* say. "Connected implies info" is not the
+    invariant: list_pairings and remove_pairing connect without enumerating on
+    purpose, because enumerating on their behalf is what makes an unpair miss
+    the controller's deadline. So a live session with no database is a legal
+    state, and the property that actually protects callers is weaker and
+    sufficient -- _ensure_connected, which every characteristic operation goes
+    through, must always be able to produce one.
+    """
     eve = FakeEve()
     pairing = build_pairing(eve)
 
-    args: dict[str, tuple] = {
-        "get_characteristics": ([(1, 2)],),
-        "put_characteristics": ([(1, 2, 1)],),
-        "subscribe": ([(1, 2)],),
-        "unsubscribe": ([(1, 2)],),
-        "remove_pairing": ("some-controller-id",),
-    }
     try:
-        await getattr(pairing, entry_point)(*args.get(entry_point, ()))
+        await getattr(pairing, entry_point)(*ENTRY_POINT_ARGS.get(entry_point, ()))
     except Exception:
-        # Failing is allowed; leaving a live session unusable is not.
+        # Failing is allowed; leaving a session that cannot recover is not.
         pass
 
-    if pairing.connection.is_connected:
-        assert pairing.connection.info is not None, (
-            f"{entry_point} left a connected session whose next characteristic op raises"
-        )
+    if pairing._shutdown:
+        # remove_pairing removes our own pairing and shuts the pairing down.
+        # There is no later characteristic operation to protect.
+        return
+    if not pairing.connection.is_connected:
+        return
+    await pairing._ensure_connected()
+    assert pairing.connection.info is not None, (
+        f"after {entry_point}, _ensure_connected returned a connection whose "
+        "next characteristic op raises AttributeError"
+    )
+
+
+@pytest.mark.parametrize("entry_point", ENTRY_POINTS)
+async def test_an_event_on_an_unenumerated_session_is_not_an_attributeerror(entry_point):
+    """The gap the sweep above concedes: EventResource.render_put is the one
+    characteristic lookup no _ensure_connected gates, so it meets info=None for
+    real on a session a pairing operation raised."""
+    eve = FakeEve()
+    pairing = build_pairing(eve)
+
+    try:
+        await getattr(pairing, entry_point)(*ENTRY_POINT_ARGS.get(entry_point, ()))
+    except Exception:
+        pass
+
+    events: list[dict] = []
+    pairing.event_received = events.append
+    resource = connection_module.EventResource(pairing.connection)
+    body = value_body(b"\x2a")
+    payload = struct.pack("<BHH", 0, 41, len(body)) + body
+
+    await resource.render_put(type("Request", (), {"payload": payload})())
+
+    assert events, f"an event arriving after {entry_point} was dropped"
+
+
+async def test_the_event_path_still_decodes_once_the_database_is_there():
+    """Tolerating info=None must not turn into never decoding: with a database
+    present the event value is the characteristic's type, not raw bytes."""
+    eve = FakeEve()
+    pairing = build_pairing(eve)
+    await pairing._ensure_connected()
+
+    events: list[dict] = []
+    pairing.event_received = events.append
+    resource = connection_module.EventResource(pairing.connection)
+    body = value_body(b"\x2a")
+    payload = struct.pack("<BHH", 0, 41, len(body)) + body
+
+    await resource.render_put(type("Request", (), {"payload": payload})())
+
+    assert events and events[0][(1, 41)]["value"] == 42, (
+        "the value was reported undecoded despite a database being available"
+    )

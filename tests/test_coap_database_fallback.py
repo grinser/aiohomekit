@@ -127,19 +127,20 @@ DEVICE = {
 }
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        AccessoryDisconnectedError,
-        EncryptionError,
-        TimeoutError,
-        AiocoapError,
-        # decode_pdu unpacks a header and builds a PDUStatus outside any try, so
-        # a short or garbage reply surfaces as one of these.
-        struct.error,
-        ValueError,
-    ],
-)
+LATCHING_PROBE_ERRORS = [
+    AccessoryDisconnectedError,
+    TimeoutError,
+    # decode_pdu unpacks a header and builds a PDUStatus outside any try, so
+    # a short or garbage reply surfaces as one of these.
+    struct.error,
+    ValueError,
+]
+
+# A fault in this session rather than a fact about the accessory.
+TRANSIENT_PROBE_ERRORS = [EncryptionError, AiocoapError]
+
+
+@pytest.mark.parametrize("error", LATCHING_PROBE_ERRORS + TRANSIENT_PROBE_ERRORS)
 async def test_every_probe_failure_falls_back_and_reconnects(error):
     conn = _connection(DEVICE, gatt_error=error)
 
@@ -147,7 +148,31 @@ async def test_every_probe_failure_falls_back_and_reconnects(error):
 
     assert _chars(database) == [2, 3, 15]
     assert conn.reconnected, "the dropped 0x09 tore the session down; it must be re-established"
+
+
+@pytest.mark.parametrize("error", LATCHING_PROBE_ERRORS)
+async def test_no_reply_at_all_latches_0x09_off(error):
+    """Silence, or a reply too mangled to be a PDU, is the signature of firmware
+    that does not implement 0x09."""
+    conn = _connection(DEVICE, gatt_error=error)
+
+    await conn._read_gatt_database()
+
     assert conn._gatt_unsupported
+
+
+@pytest.mark.parametrize("error", TRANSIENT_PROBE_ERRORS)
+async def test_a_transient_probe_failure_does_not_latch_0x09_off(error):
+    """The mirror of test_a_transient_status_does_not_latch_0x09_off, which the
+    exception branch used to contradict: a desynced session or a transport error
+    is a fault in this session, not evidence about the accessory. The flag is
+    never cleared, so latching here downgrades a capable accessory to a
+    300-request walk for good on the strength of one bad decrypt."""
+    conn = _connection(DEVICE, gatt_error=error)
+
+    await conn._read_gatt_database()
+
+    assert not conn._gatt_unsupported
 
 
 async def test_probe_error_status_does_not_tear_down_the_session():
@@ -210,7 +235,7 @@ async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
     """
     conn = _connection({}, gatt_error=AccessoryDisconnectedError)
 
-    async def failing_walk(max_iid):
+    async def failing_walk(max_iid=SIGNATURE_WALK_MAX_IID):
         raise AccessoryDisconnectedError("walk died")
 
     conn._signature_walk = failing_walk

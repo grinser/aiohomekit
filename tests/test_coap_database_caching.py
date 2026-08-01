@@ -34,9 +34,10 @@ class FakeConnection:
         self.database_from_walk = from_walk
         self.invalidated = False
 
-    async def get_accessory_info(self):
+    async def get_accessory_info(self, verify_attempts=1):
         import copy
 
+        self.verify_attempts = verify_attempts
         return copy.deepcopy(ACCESSORY)
 
     def invalidate_database(self):

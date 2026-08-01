@@ -139,60 +139,56 @@ async def test_the_lookup_gives_up_cleanly_when_there_is_no_pairing_service():
     assert not conn.enc_ctx.writes, "nothing may be written without the characteristic"
 
 
-async def test_a_bounded_read_that_ends_on_the_miss_counter_is_still_partial():
+async def test_a_bounded_read_publishes_no_database_at_all():
     """PAIRING_SERVICE_MAX_IID exceeds SIGNATURE_WALK_MAX_MISSES, so a bounded
     read can terminate on the miss counter and look 'complete'. It is not: the
-    bound was chosen to find one characteristic, and publishing the result as
-    the whole accessory would let every later enumeration reuse it."""
-    conn = _connection({2: _sig(0x14, ACCESSORY_INFORMATION, 1), 3: _sig(0x20, ACCESSORY_INFORMATION, 1)})
-
-    await conn.get_accessory_info(PAIRING_SERVICE_MAX_IID)
-
-    assert conn.database_is_partial, "a bounded read must never claim completeness"
-
-    # And therefore the next full enumeration re-reads instead of reusing.
-    conn.enc_ctx.walked.clear()
-    await conn.get_accessory_info()
-    assert conn.enc_ctx.walked, "the bounded database must not satisfy a full enumeration"
-    assert not conn.database_is_partial, "the full walk ended on the miss counter for real"
-
-
-async def test_the_pairings_lookup_waits_for_a_running_enumeration():
-    """The lookup routes through get_accessory_info, which holds the
-    enumeration lock. Enumerating directly would let the bounded read overwrite
-    a full database another caller was still publishing."""
+    bound was chosen to find one characteristic. Rather than marking the result
+    partial and relying on every later reader to honour that, the lookup keeps
+    it to itself -- there is no way to misuse a database that was never
+    published."""
     conn = _connection(DEVICE)
-    gate = asyncio.Event()
-    reached = asyncio.Event()
-    in_flight = 0
-    max_in_flight = 0
-    gated_once = False
-    orig_post = conn.enc_ctx.post
 
-    async def gated_post(opcode, iid, data, **kwargs):
-        nonlocal in_flight, max_in_flight, gated_once
-        if opcode is OpCode.CHAR_SIG_READ:
-            in_flight += 1
-            max_in_flight = max(max_in_flight, in_flight)
-            if not gated_once:
-                gated_once = True
-                reached.set()
-                await gate.wait()
-            result = await orig_post(opcode, iid, data, **kwargs)
-            in_flight -= 1
-            return result
-        return await orig_post(opcode, iid, data, **kwargs)
+    assert await conn.remove_pairing("controller-id") is True
 
-    conn.enc_ctx.post = gated_post
+    assert conn.info is None, "the bounded read published its truncated database"
+    assert not conn.database_from_walk, "the bounded read claimed to have enumerated"
+
+
+async def test_the_pairings_lookup_does_not_wait_for_a_running_enumeration():
+    """An unpair is on a deadline the controller enforces: on hardware a full
+    walk ran to iid 84 and the unpair was cancelled 0.3 s before it finished,
+    which orphans the pairing on the accessory. So the lookup must not queue
+    behind an enumeration somebody else started -- which is safe precisely
+    because it publishes nothing (see above) and so has nothing to clobber."""
+    conn = _connection(DEVICE)
+    walk_started = asyncio.Event()
+    hold_the_walk = asyncio.Event()
+    original_walk = conn._signature_walk
+
+    async def blocked_full_walk(max_iid=SIGNATURE_WALK_MAX_IID):
+        if max_iid == SIGNATURE_WALK_MAX_IID:
+            walk_started.set()
+            await hold_the_walk.wait()
+        return await original_walk(max_iid)
+
+    conn._signature_walk = blocked_full_walk
 
     full = asyncio.create_task(conn.get_accessory_info())
-    await reached.wait()
-    removal = asyncio.create_task(conn.remove_pairing("controller-id"))
-    await asyncio.sleep(0)
-    gate.set()
-    await asyncio.gather(full, removal)
+    await walk_started.wait()
 
-    assert max_in_flight == 1, "the bounded lookup must wait for the enumeration lock"
+    removal = asyncio.create_task(conn.remove_pairing("controller-id"))
+    try:
+        await asyncio.wait_for(asyncio.shield(removal), timeout=0.25)
+        blocked = False
+    except asyncio.TimeoutError:
+        blocked = True
+    finally:
+        hold_the_walk.set()
+        for task in (full, removal):
+            task.cancel()
+        await asyncio.gather(full, removal, return_exceptions=True)
+
+    assert not blocked, "the unpair queued behind a full walk it did not start"
     assert conn.enc_ctx.writes == [18]
 
 
@@ -208,9 +204,9 @@ async def test_connect_does_not_enumerate_for_a_pairing_operation():
 
     original = conn.get_accessory_info
 
-    async def record(max_iid=SIGNATURE_WALK_MAX_IID):
-        enumerations.append(max_iid)
-        return await original(max_iid)
+    async def record(verify_attempts=1):
+        enumerations.append(verify_attempts)
+        return await original(verify_attempts)
 
     conn.get_accessory_info = record
 
@@ -225,15 +221,15 @@ async def test_connect_still_enumerates_for_everything_else():
     enumerations = []
     original = conn.get_accessory_info
 
-    async def record(max_iid=SIGNATURE_WALK_MAX_IID):
-        enumerations.append(max_iid)
-        return await original(max_iid)
+    async def record(verify_attempts=1):
+        enumerations.append(verify_attempts)
+        return await original(verify_attempts)
 
     conn.get_accessory_info = record
 
-    await conn.connect({"AccessoryPairingID": "x"})
+    await conn.connect({"AccessoryPairingID": "x"}, attempts=3)
 
-    assert enumerations == [SIGNATURE_WALK_MAX_IID], "polling still needs the database"
+    assert enumerations == [3], "polling still needs the database, on the caller's budget"
 
 
 async def test_a_bounded_read_uses_the_short_0x09_probe():
@@ -242,7 +238,7 @@ async def test_a_bounded_read_uses_the_short_0x09_probe():
     the measured unpair budget."""
     conn = _connection(DEVICE)
 
-    await conn.get_accessory_info(PAIRING_SERVICE_MAX_IID)
+    assert await conn.remove_pairing("controller-id") is True
 
     assert conn.enc_ctx.probe_timeouts == [PAIRING_PROBE_TIMEOUT]
     assert PAIRING_PROBE_TIMEOUT < GATT_PROBE_TIMEOUT

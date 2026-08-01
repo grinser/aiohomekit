@@ -110,8 +110,14 @@ class CoAPPairing(ZeroconfPairing):
         async with self.connection_lock:
             if self._shutdown:
                 return
-            # are we already connected?
-            if self.connection.is_connected:
+            # Connected is not the same as ready. A pairing operation connects
+            # with enumerate_database=False and leaves a live session with no
+            # database behind it; returning here on that state would hand the
+            # next characteristic read a connection whose info is None, which it
+            # dereferences unguarded.
+            if self.connection.is_connected and (
+                not enumerate_database or self.connection.info is not None
+            ):
                 return
 
             # if there isn't a connection in progress, we're in the driver's seat
@@ -129,6 +135,11 @@ class CoAPPairing(ZeroconfPairing):
                 # if the primary coroutine failed to connect, we also raise
                 if not self.connection.is_connected:
                     raise AccessoryDisconnectedError("primary coroutine failed to connect")
+                if enumerate_database and self.connection.info is None:
+                    # The primary was a pairing operation, which does not
+                    # enumerate. Its session is fine but it is not the one this
+                    # caller asked for; retrying is the caller's job.
+                    raise AccessoryDisconnectedError("primary coroutine connected without enumerating")
                 return
 
         try:
@@ -173,7 +184,7 @@ class CoAPPairing(ZeroconfPairing):
     ) -> list[dict[str, Any]]:
         await self._ensure_connected(pair_verify_attempts)
 
-        accessories = await self.connection.get_accessory_info()
+        accessories = await self.connection.get_accessory_info(verify_attempts=pair_verify_attempts)
 
         for accessory in accessories:
             for service in accessory["services"]:

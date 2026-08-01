@@ -35,7 +35,7 @@ def _connection():
     owner = type("Owner", (), {"accessories": None, "event_received": lambda *a: None})()
     conn = CoAPHomeKitConnection(owner, "::1", 5683)
 
-    async def no_enumeration():
+    async def no_enumeration(verify_attempts=1):
         return []
 
     # The retry policy under test ends where enumeration begins.

@@ -147,6 +147,11 @@ class FakeEve:
 
         raise AssertionError(f"unexpected opcode {opcode}")
 
+    def decrypt_event(self, payload: bytes) -> bytes:
+        # The event path's crypto is not what these tests are about; the
+        # accessory is modelled as always sending a well-formed event.
+        return payload
+
     async def post_all(self, opcode, iids, data):
         if opcode is OpCode.CHAR_READ or opcode is OpCode.UNK_09_READ_GATT:
             return [self.values.get(iid, PDUStatus.INVALID_REQUEST) for iid in iids]
