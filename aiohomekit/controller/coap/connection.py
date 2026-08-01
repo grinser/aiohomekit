@@ -528,22 +528,24 @@ class CoAPHomeKitConnection:
             else:
                 await self._verify_with_retries(pairing_data, attempts)
 
-            if enumerate_database:
-                # Needed to read/write characteristics -- but a pairing
-                # operation needs exactly one characteristic and finds it
-                # itself, so making it wait out a full enumeration here is what
-                # pushes an unpair past the controller's patience. Measured on
-                # an Eve Room: a cold remove_pairing spent 20 s on the 0x09
-                # probe and 23 s in the walk this call started, and was
-                # cancelled 0.3 s before the walk would have finished.
-                #
-                # Reached even when the session was already up, because a
-                # session established for a pairing operation deliberately has
-                # no database behind it, and the caller that asked to enumerate
-                # is about to dereference one.
-                await self.get_accessory_info(verify_attempts=attempts)
-
-            return
+        # Deliberately outside connection_lock, which is there to keep two
+        # pair-verifies from racing. Enumeration has its own lock, and holding
+        # this one across a ~300-request walk would make every other caller --
+        # including an unpair the controller is timing -- wait for the walk.
+        if enumerate_database:
+            # Needed to read/write characteristics -- but a pairing operation
+            # needs exactly one characteristic and finds it itself, so making it
+            # wait out a full enumeration here is what pushes an unpair past the
+            # controller's patience. Measured on an Eve Room: a cold
+            # remove_pairing spent 20 s on the 0x09 probe and 23 s in the walk
+            # this call started, and was cancelled 0.3 s before the walk would
+            # have finished.
+            #
+            # Reached even when the session was already up, because a session
+            # established for a pairing operation deliberately has no database
+            # behind it, and the caller that asked to enumerate is about to
+            # dereference one.
+            await self.get_accessory_info(verify_attempts=attempts)
 
     async def _verify_with_retries(self, pairing_data, attempts: int) -> None:
         """Run pair-verify, retrying up to `attempts` times.

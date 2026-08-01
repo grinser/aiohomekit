@@ -106,65 +106,70 @@ class CoAPPairing(ZeroconfPairing):
         what makes an unpair miss the controller's deadline on an accessory
         that has to be enumerated by walking.
         """
+        primary = False
         # let in one coroutine at a time
         async with self.connection_lock:
             if self._shutdown:
                 return
-            # Connected is not the same as ready. A pairing operation connects
-            # with enumerate_database=False and leaves a live session with no
-            # database behind it; returning here on that state would hand the
-            # next characteristic read a connection whose info is None, which it
-            # dereferences unguarded.
-            if self.connection.is_connected and (
-                not enumerate_database or self.connection.info is not None
-            ):
-                return
 
-            # if there isn't a connection in progress, we're in the driver's seat
-            if self.connection_future is None:
-                # start a connection but don't await it here
-                self.connection_future = self.connection.connect(
-                    self.pairing_data,
-                    attempts=pair_verify_attempts,
-                    enumerate_database=enumerate_database,
-                )
+            if not self.connection.is_connected:
+                # if there isn't a connection in progress, we're in the driver's seat
+                if self.connection_future is None:
+                    primary = True
+                    # The future covers establishing the session and nothing
+                    # else. Enumeration happens after it, below: a caller that
+                    # only needs a session -- an unpair, which the controller is
+                    # timing -- must not wait out a ~300-request walk that
+                    # somebody else's poll started. That wait is how an unpair
+                    # gets abandoned, which orphans the pairing on the
+                    # accessory. The race is routine rather than exotic:
+                    # load_pairing schedules _process_config_changed in the
+                    # background whenever zeroconf has a cached discovery, and
+                    # the controller calls remove_pairing right afterwards.
+                    self.connection_future = self.connection.connect(
+                        self.pairing_data,
+                        attempts=pair_verify_attempts,
+                        enumerate_database=False,
+                    )
+                else:
+                    # we'll wait on the primary coroutine & copy how it returns
+                    # this drops the lock and reacquires it when we're notified
+                    await self.connection_lock.wait()
+                    # if the primary coroutine failed to connect, we also raise
+                    if not self.connection.is_connected:
+                        raise AccessoryDisconnectedError("primary coroutine failed to connect")
+
+        if primary:
+            try:
+                # await the connection outside of the lock
+                # this allows other coroutines to show up & wait
+                await self.connection_future
+            except BaseException:
+                raise AccessoryDisconnectedError("failed to connect")
             else:
-                # we'll wait on the primary coroutine & copy how it returns
-                # this drops the lock and reacquires it when we're notified
-                await self.connection_lock.wait()
-                # if the primary coroutine failed to connect, we also raise
-                if not self.connection.is_connected:
-                    raise AccessoryDisconnectedError("primary coroutine failed to connect")
-                if enumerate_database and self.connection.info is None:
-                    # The primary was a pairing operation, which does not
-                    # enumerate. Its session is fine but it is not the one this
-                    # caller asked for; retrying is the caller's job.
-                    raise AccessoryDisconnectedError("primary coroutine connected without enumerating")
-                return
+                # in case this was a reconnect, re-subscribe
+                if len(self.subscriptions):
+                    logger.debug(
+                        "(Re-)subscribing to %d characteristics: %r"
+                        % (len(self.subscriptions), self.subscriptions)
+                    )
+                    await self.connection.subscribe_to(list(self.subscriptions))
+                self._callback_availability_changed(True)
+            finally:
+                # until we re-acquire the lock & clear connection_future,
+                # other coroutines that show up will all hit the .wait() path.
+                async with self.connection_lock:
+                    # clear the flag indicating a connection is in progress
+                    self.connection_future = None
+                    # wake up any coroutines that showed up while we were connecting
+                    self.connection_lock.notify_all()
 
-        try:
-            # await the connection outside of the lock
-            # this allows other coroutines to show up & wait
-            await self.connection_future
-        except BaseException:
-            raise AccessoryDisconnectedError("failed to connect")
-        else:
-            # in case this was a reconnect, re-subscribe
-            if len(self.subscriptions):
-                logger.debug(
-                    "(Re-)subscribing to %d characteristics: %r"
-                    % (len(self.subscriptions), self.subscriptions)
-                )
-                await self.connection.subscribe_to(list(self.subscriptions))
-            self._callback_availability_changed(True)
-        finally:
-            # until we re-acquire the lock & clear connection_future,
-            # other coroutines that show up will all hit the .wait() path.
-            async with self.connection_lock:
-                # clear the flag indicating a connection is in progress
-                self.connection_future = None
-                # wake up any coroutines that showed up while we were connecting
-                self.connection_lock.notify_all()
+        # Connected is not the same as ready: a session raised for a pairing
+        # operation has no database behind it, and the next characteristic read
+        # dereferences info unguarded. Serialised by the connection's own
+        # enumeration lock, so two callers arriving together cost one walk.
+        if enumerate_database and self.connection.info is None:
+            await self.connection.get_accessory_info(verify_attempts=pair_verify_attempts)
 
         return
 
@@ -182,7 +187,10 @@ class CoAPPairing(ZeroconfPairing):
     async def list_accessories_and_characteristics(
         self, pair_verify_attempts: int = 1
     ) -> list[dict[str, Any]]:
-        await self._ensure_connected(pair_verify_attempts)
+        # enumerate_database=False: this method does its own read below, and
+        # letting _ensure_connected do one first would cost a second full pass
+        # over every readable characteristic.
+        await self._ensure_connected(pair_verify_attempts, enumerate_database=False)
 
         accessories = await self.connection.get_accessory_info(verify_attempts=pair_verify_attempts)
 

@@ -22,6 +22,7 @@ from aiohomekit.controller.coap.connection import (
 )
 from aiohomekit.controller.coap.structs import Pdu09Database
 from aiohomekit.exceptions import AccessoryDisconnectedError
+from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
 from .coap_eve_harness import (
     FakeEve,
@@ -176,23 +177,52 @@ async def test_inv5_a_bounded_read_installs_no_database_of_its_own():
 # --------------------------------------------------------------------------
 
 
-async def test_inv13_an_empty_0x09_database_is_rejected():
-    """The walk path guards this; the 0x09 path did not. _pairings_characteristic
-    indexes accessories[0] unguarded, so an empty database is an IndexError at
-    the worst possible moment -- during an unpair."""
-    empty = Pdu09Database(_accessories=[]).encode()
-    eve = FakeEve(gatt="body", gatt_body=empty)
+# Every shape of 0x09 reply that carries no usable database. The empty case is
+# the interesting one: Pdu09Database(_accessories=[]).encode() is b'', and
+# decoding it leaves _accessories None, so `.accessories` raises rather than
+# returning [] -- an empty database cannot be constructed by decode at all.
+USELESS_0X09_BODIES = {
+    "empty": Pdu09Database(_accessories=[]).encode(),
+    "garbage": b"\xde\xad\xbe\xef",
+    "wrong-tag": bytes(TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, b"\x01")])),
+    "truncated-entry": bytes(TLV.encode_list([(HAP_TLV.kTLVHAPParamUnknown_18, b"")])),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(USELESS_0X09_BODIES))
+async def test_inv13_a_0x09_reply_with_no_database_is_never_installed(shape):
+    """_pairings_characteristic indexes accessories[0], and the controller
+    caches whatever is installed, so a database with no accessories is an
+    IndexError at the worst possible moment -- during an unpair -- or a cached
+    accessory that permanently has no characteristics.
+
+    Whichever way the reply is useless, the outcome must be the same: fall back
+    to the walk, or fail. Never publish it.
+    """
+    eve = FakeEve(gatt="body", gatt_body=USELESS_0X09_BODIES[shape])
     conn = build_connection(eve)
 
-    # Either it refuses outright or it falls back to the walk; what it must not
-    # do is install a database whose accessories[0] does not exist.
     try:
         await conn.get_accessory_info()
     except AccessoryDisconnectedError:
         return
     assert conn.info is not None and list(conn.info.accessories), (
-        "an empty database was installed; _pairings_characteristic indexes accessories[0]"
+        "a database with no accessories was installed"
     )
+    assert not conn._gatt_unsupported, "0x09 did answer, so it must not be latched off"
+
+
+async def test_inv13_a_walk_that_decodes_to_nothing_is_never_installed():
+    """The same invariant on the other producer. Signatures that all fail to
+    decode yield a database with no accessories, and unlike the 0x09 path
+    nothing upstream raises on the way there."""
+    eve = FakeEve(layout={2: b"\x00\x01\x02", 3: b"\x00\x01\x02"})
+    conn = build_connection(eve)
+
+    with pytest.raises(AccessoryDisconnectedError):
+        await conn.get_accessory_info()
+
+    assert conn.info is None, "a database with no accessories was installed"
 
 
 # --------------------------------------------------------------------------
@@ -240,6 +270,66 @@ async def test_inv8_remove_pairing_does_not_wait_for_a_full_enumeration():
         await asyncio.gather(full, removal, return_exceptions=True)
 
     assert not blocked, "the unpair queued behind a full walk it did not start"
+
+
+async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration():
+    """The same invariant one layer up, which the connection-level fix does not
+    cover. CoAPPairing funnels concurrent callers through a Condition, and the
+    in-flight future used to include the enumeration -- so an unpair arriving
+    while pair-verify was still running waited for the whole walk.
+
+    That race is not hypothetical: load_pairing schedules _process_config_changed
+    in the background whenever zeroconf has a cached discovery, and Home
+    Assistant calls remove_pairing straight afterwards, so the two start
+    together.
+    """
+    eve = FakeEve()
+    pairing = build_pairing(eve)
+    conn = pairing.connection
+
+    verify_started = asyncio.Event()
+    release_verify = asyncio.Event()
+    walk_started = asyncio.Event()
+    hold_the_walk = asyncio.Event()
+    original_verify = conn.do_pair_verify
+    original_walk = conn._signature_walk
+
+    async def slow_verify(pairing_data):
+        verify_started.set()
+        await release_verify.wait()
+        await original_verify(pairing_data)
+
+    async def blocked_full_walk(max_iid=SIGNATURE_WALK_MAX_IID):
+        if max_iid == SIGNATURE_WALK_MAX_IID:
+            walk_started.set()
+            await hold_the_walk.wait()
+        return await original_walk(max_iid)
+
+    conn.do_pair_verify = slow_verify
+    conn._signature_walk = blocked_full_walk
+
+    enumeration = asyncio.create_task(pairing.list_accessories_and_characteristics())
+    await verify_started.wait()
+
+    # The unpair arrives while the session is still being established, so it
+    # cannot simply find one already there.
+    removal = asyncio.create_task(pairing.remove_pairing("some-controller-id"))
+    await asyncio.sleep(0)
+    release_verify.set()
+    await walk_started.wait()
+
+    try:
+        await asyncio.wait_for(asyncio.shield(removal), timeout=0.25)
+        blocked = False
+    except asyncio.TimeoutError:
+        blocked = True
+    finally:
+        hold_the_walk.set()
+        for task in (enumeration, removal):
+            task.cancel()
+        await asyncio.gather(enumeration, removal, return_exceptions=True)
+
+    assert not blocked, "the unpair waited for an enumeration that was not its own"
 
 
 # --------------------------------------------------------------------------
