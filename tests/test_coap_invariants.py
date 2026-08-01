@@ -272,6 +272,45 @@ async def test_inv8_remove_pairing_does_not_wait_for_a_full_enumeration():
     assert not blocked, "the unpair queued behind a full walk it did not start"
 
 
+async def test_inv8_remove_pairing_does_not_wait_on_a_connect_driven_enumeration():
+    """The third door into the same failure. connect() enumerates when asked,
+    and it used to do so while holding connection_lock -- which every other
+    connect(), including the one an unpair needs, has to acquire. That lock is
+    there to serialise pair-verify; the walk has _enumeration_lock of its own.
+    """
+    eve = FakeEve()
+    conn = build_connection(eve, session=False)
+
+    walk_started = asyncio.Event()
+    hold_the_walk = asyncio.Event()
+    original_walk = conn._signature_walk
+
+    async def blocked_full_walk(max_iid=SIGNATURE_WALK_MAX_IID):
+        if max_iid == SIGNATURE_WALK_MAX_IID:
+            walk_started.set()
+            await hold_the_walk.wait()
+        return await original_walk(max_iid)
+
+    conn._signature_walk = blocked_full_walk
+
+    enumerating = asyncio.create_task(conn.connect(dict(), enumerate_database=True))
+    await walk_started.wait()
+
+    removal = asyncio.create_task(conn.remove_pairing("some-controller-id"))
+    try:
+        await asyncio.wait_for(asyncio.shield(removal), timeout=0.25)
+        blocked = False
+    except asyncio.TimeoutError:
+        blocked = True
+    finally:
+        hold_the_walk.set()
+        for task in (enumerating, removal):
+            task.cancel()
+        await asyncio.gather(enumerating, removal, return_exceptions=True)
+
+    assert not blocked, "the unpair queued behind a walk connect() was holding the lock for"
+
+
 async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration():
     """The same invariant one layer up, which the connection-level fix does not
     cover. CoAPPairing funnels concurrent callers through a Condition, and the
