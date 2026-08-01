@@ -272,11 +272,11 @@ async def test_inv8_remove_pairing_does_not_wait_for_a_full_enumeration():
     assert not blocked, "the unpair queued behind a full walk it did not start"
 
 
-async def test_inv8_remove_pairing_does_not_wait_on_a_connect_driven_enumeration():
-    """The third door into the same failure. connect() enumerates when asked,
-    and it used to do so while holding connection_lock -- which every other
-    connect(), including the one an unpair needs, has to acquire. That lock is
-    there to serialise pair-verify; the walk has _enumeration_lock of its own.
+async def test_inv8_connect_does_not_hold_the_connection_lock_across_a_walk():
+    """connection_lock exists to keep two pair-verifies from racing; the walk
+    has _enumeration_lock of its own. Holding both across the walk means any
+    other connect() -- including the session-only one a pairing operation asks
+    for -- waits out an enumeration it has no interest in.
     """
     eve = FakeEve()
     conn = build_connection(eve, session=False)
@@ -296,19 +296,20 @@ async def test_inv8_remove_pairing_does_not_wait_on_a_connect_driven_enumeration
     enumerating = asyncio.create_task(conn.connect(dict(), enumerate_database=True))
     await walk_started.wait()
 
-    removal = asyncio.create_task(conn.remove_pairing("some-controller-id"))
+    # A second caller wanting only a session, which is already established.
+    session_only = asyncio.create_task(conn.connect(dict(), enumerate_database=False))
     try:
-        await asyncio.wait_for(asyncio.shield(removal), timeout=0.25)
+        await asyncio.wait_for(asyncio.shield(session_only), timeout=0.25)
         blocked = False
     except asyncio.TimeoutError:
         blocked = True
     finally:
         hold_the_walk.set()
-        for task in (enumerating, removal):
+        for task in (enumerating, session_only):
             task.cancel()
-        await asyncio.gather(enumerating, removal, return_exceptions=True)
+        await asyncio.gather(enumerating, session_only, return_exceptions=True)
 
-    assert not blocked, "the unpair queued behind a walk connect() was holding the lock for"
+    assert not blocked, "connect() held connection_lock for the length of the walk"
 
 
 async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration():
