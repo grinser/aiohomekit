@@ -85,6 +85,7 @@ class FakeEve:
         gatt_status: PDUStatus = PDUStatus.UNSUPPORTED_PDU,
         gatt_delay: float = 0.0,
         values: dict[int, bytes] | None = None,
+        rtt: float = 0.5,
     ):
         self.layout = EVE_LAYOUT if layout is None else layout
         self.gatt = gatt
@@ -101,8 +102,33 @@ class FakeEve:
         self.walked: list[int] = []
         self.writes: list[tuple[int, bytes]] = []
         self.reads: list[int] = []
+        # Ordered log of every request, so a test can assert what an operation
+        # COST rather than only what it produced. The counts are the point: on
+        # this hardware a request is ~0.5 s, and the defect that orphaned a real
+        # device was 37 correct requests where 2 were affordable.
+        self.requests: list[tuple[OpCode, int]] = []
+        # Virtual time. Nothing sleeps -- each request advances a counter -- so
+        # "elapsed" is assertable and deterministic under CI load.
+        self.rtt = rtt
+        self.elapsed = 0.0
+
+    def total_requests(self) -> int:
+        return len(self.requests)
+
+    def requests_before_first_write(self) -> int:
+        """Cost to reach the commit point.
+
+        For a removal the write of RemovePairing M1 is the moment the accessory
+        acts; everything before it is discovery the caller is paying for.
+        """
+        for index, (opcode, _) in enumerate(self.requests):
+            if opcode is OpCode.CHAR_WRITE:
+                return index
+        return len(self.requests)
 
     async def post(self, opcode, iid, data, timeout=16.0, expected_statuses=()):
+        self.requests.append((opcode, iid))
+        self.elapsed += self.rtt
         if opcode is OpCode.UNK_09_READ_GATT:
             self.probes.append(timeout)
             if self.gatt_delay:
@@ -134,6 +160,11 @@ class FakeEve:
 
         if opcode is OpCode.CHAR_WRITE:
             self.writes.append((iid, data))
+            if iid not in self.layout:
+                # A real accessory rejects a write to an iid it does not have.
+                # Answering every write with success made a whole class of
+                # defect -- writing to the wrong characteristic -- inexpressible.
+                return (0, PDUStatus.INVALID_INSTANCE_ID)
             return (0, b"")
 
         if opcode is OpCode.CHAR_READ:
@@ -174,6 +205,49 @@ def description(config_num: int = 2, state_num: int = 1) -> HomeKitService:
         addresses=["fdc8::1"],
         port=5683,
     )
+
+
+PAIRING_SERVICE_UUID = "00000055-0000-1000-8000-0026BB765291"
+PAIRINGS_CHAR_UUID = "00000050-0000-1000-8000-0026BB765291"
+
+
+def cached_map(pairings_iid: int = PAIRINGS_IID, config_num: int = -1) -> dict:
+    """An entity map of the shape a controller restores before a removal.
+
+    This is the input the harness used to throw away. Both fixtures hard-coded
+    `accessories: None` on their fake owner, so every test modelled a *cold*
+    pairing -- but a removal is always *warm*, because a controller cannot
+    delete a config entry that never had an entity map. Nulling it made the one
+    condition under which the production code is correct the only condition
+    ever tested.
+
+    Mirrors a real Eve Room: one accessory, the Pairing service carrying a
+    writable Pairings characteristic. `config_num=-1` by default because that is
+    the marker this repo persists walk-built databases under, so the default
+    exercises the least-trusted cache we ever store.
+    """
+    return {
+        "config_num": config_num,
+        "accessories": [
+            {
+                "aid": 1,
+                "services": [
+                    {
+                        "iid": 16,
+                        "type": PAIRING_SERVICE_UUID,
+                        "characteristics": [
+                            {
+                                "iid": pairings_iid,
+                                "type": PAIRINGS_CHAR_UUID,
+                                "perms": ["pr", "pw"],
+                                "format": "tlv8",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
 
 
 PAIRING_DATA = {
@@ -240,13 +314,20 @@ def build_pairing(
     sleepy_verifies: int = 0,
     with_description: bool = True,
     session: bool = False,
+    cached_accessories: dict | None = None,
 ) -> CoAPPairing:
     """A CoAPPairing over `eve`, built the way the controller builds one.
 
     Defaults to no session: a pairing handed to an entry point should have to
     establish one, so the entry point's own behaviour is what is observed.
+
+    `cached_accessories` is the stored entity map, installed BEFORE construction
+    because AbstractPairing.__init__ reads it -- pass `cached_map()` to model a
+    warm pairing, which is what a removal always is in the field.
     """
     controller = FakeController()
+    if cached_accessories is not None:
+        controller._char_cache.map = cached_accessories
     desc = description() if with_description else None
     pairing = CoAPPairing(controller, dict(PAIRING_DATA), description=desc)
     conn = build_connection(eve, sleepy_verifies=sleepy_verifies, session=session)

@@ -25,9 +25,11 @@ from aiohomekit.exceptions import AccessoryDisconnectedError
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
 from .coap_eve_harness import (
+    PAIRINGS_IID,
     FakeEve,
     build_connection,
     build_pairing,
+    cached_map,
     value_body,
 )
 
@@ -370,6 +372,92 @@ async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration(
         await asyncio.gather(enumeration, removal, return_exceptions=True)
 
     assert not blocked, "the unpair waited for an enumeration that was not its own"
+
+
+# --------------------------------------------------------------------------
+# INV-17: what a pairing operation may COST
+# --------------------------------------------------------------------------
+#
+# The category every other invariant here is missing. All of them are
+# reachability predicates -- must not block, must not latch, must not publish.
+# The defect that orphaned a real device violated none of them: the removal did
+# exactly what INV-8 demands and still lost, because 37 correct round-trips do
+# not fit in the time a controller allows.
+#
+# A round-trip is ~0.5 s on this hardware, and the deadline is not a constant --
+# it is however long the caller's HTTP client stays connected, measured between
+# 10 s and 45 s on the same device with no code change. So the requirement is
+# not "be fast enough", it is "make the write the next thing on the wire".
+
+# 1 pair-verify + M1 write + M2 read. The signature pre-check of a cached iid,
+# when added, makes it 4.
+REMOVE_PAIRING_MAX_REQUESTS = 2
+
+
+async def test_inv17_an_unpair_served_from_cache_costs_two_round_trips():
+    """A warm pairing already holds the Pairings characteristic's instance id --
+    the controller restored it from the entity map before handing us the
+    pairing. Rediscovering it over the air is the whole defect."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=cached_map())
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert eve.probes == [], "an unpair probed 0x09"
+    assert eve.walked == [], "an unpair enumerated an accessory it already had a map for"
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
+    assert eve.reads == [PAIRINGS_IID]
+    assert eve.total_requests() <= REMOVE_PAIRING_MAX_REQUESTS, (
+        f"an unpair cost {eve.total_requests()} round-trips "
+        f"(~{eve.elapsed:.1f}s at {eve.rtt}s each); budget is {REMOVE_PAIRING_MAX_REQUESTS}"
+    )
+
+
+async def test_inv17_nothing_speculative_precedes_the_commit_point():
+    """Stated as a separate property because it is the one that actually bit:
+    the probe and the walk were both 'correct', and both ran before the only
+    request that changes anything on the accessory."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=cached_map())
+
+    await pairing.remove_pairing("some-controller-id")
+
+    assert eve.requests_before_first_write() == 0, (
+        "requests were issued before RemovePairing M1; everything before the "
+        "commit point is discovery the caller is paying for"
+    )
+
+
+async def test_inv17_an_unpair_without_a_cache_still_removes_the_pairing():
+    """The fallback is allowed to be slow. It is not allowed to be wrong --
+    otherwise the fast path is the only path that works and a cache miss
+    silently orphans the device."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=None)
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
+    assert eve.walked, "with no cache the iid has to come from somewhere"
+
+
+async def test_inv17_a_stale_cached_iid_does_not_silently_write_elsewhere():
+    """The risk the cache-first design takes on. A cached iid that no longer
+    holds the Pairings characteristic must not be written to and reported as a
+    successful unpair -- that is an orphan the user is told did not happen."""
+    eve = FakeEve()
+    # 250 is absent from EVE_LAYOUT, so the accessory rejects the write.
+    pairing = build_pairing(eve, cached_accessories=cached_map(pairings_iid=250))
+
+    try:
+        removed = await pairing.remove_pairing("some-controller-id")
+    except Exception:
+        return  # failing loudly is a correct outcome
+
+    assert removed is True, "reported failure is fine; reporting success is not"
+    assert [iid for iid, _ in eve.writes][-1] == PAIRINGS_IID, (
+        "a stale cached iid was written to and the removal reported success"
+    )
 
 
 # --------------------------------------------------------------------------
