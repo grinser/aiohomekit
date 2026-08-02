@@ -772,3 +772,13 @@ async def test_a_dropped_session_leaves_no_usable_context_behind():
 
     assert context.coap_ctx is None, "the dropped session still points at its transport"
     assert transport.shutdown_calls == 1, "the transport was dropped without being shut down"
+
+
+# A reviewer flagged that a cached characteristic with `perms: null` would make
+# the membership test raise TypeError inside _cached_pairings_iid. It cannot:
+# the model rejects it first, in Characteristic.__init__ via
+# _load_accessories_from_cache, so a cache that bad fails while the pairing is
+# being constructed and never reaches this lookup. Any cache that loaded has a
+# list here. (That earlier failure is its own pre-existing problem -- it makes
+# load_pairing raise TypeError, which a controller's removal path does not
+# catch -- but it is not this transport's to fix.)

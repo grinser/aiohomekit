@@ -1149,7 +1149,10 @@ class CoAPHomeKitConnection:
         outlier.
         """
         owner = self.owner
-        accessories = getattr(owner, "accessories", None) if owner is not None else None
+        # Direct attribute access, not getattr with a default: every owner is a
+        # CoAPPairing and has this property, so a default would only ever mask
+        # a genuine error raised inside it.
+        accessories = owner.accessories if owner is not None else None
         if not accessories:
             return None
         accessory = accessories.aid_or_none(COAP_ACCESSORY_IID)
