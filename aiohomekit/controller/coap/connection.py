@@ -251,12 +251,15 @@ class EncryptionContext:
 
     async def post_bytes(self, payload: bytes, timeout: float = DEFAULT_POST_TIMEOUT):
         async with self.lock:
-            # Captured once, deliberately. Concurrent callers are routine -- a
-            # config-changed enumeration runs while a pairing operation is in
-            # flight -- and any of them may null coap_ctx from under us.
-            # Re-reading self.coap_ctx after an await would reintroduce that
-            # race; teardown does not take this lock, so the local is what makes
-            # this safe, not the check.
+            # Concurrent callers are routine -- a config-changed enumeration
+            # runs while a pairing operation is in flight -- and any of them may
+            # null coap_ctx from under us. Teardown does not take this lock.
+            #
+            # The check turns that into a disconnect the caller can retry; it
+            # used to surface as AttributeError, which no controller catches.
+            # The local matters further down: the shutdown paths must close the
+            # context this request actually used, not whatever the attribute
+            # holds by then, or a teardown racing us leaks it.
             if (coap_ctx := self.coap_ctx) is None:
                 raise AccessoryDisconnectedError("Session closed")
 
