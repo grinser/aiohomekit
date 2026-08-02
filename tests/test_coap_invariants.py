@@ -28,9 +28,11 @@ from aiohomekit.protocol.tlv import HAP_TLV, TLV
 from .coap_eve_harness import (
     PAIRINGS_IID,
     FakeEve,
+    bridged_cached_map,
     build_connection,
     build_pairing,
     cached_map,
+    read_only_cached_map,
     value_body,
 )
 
@@ -477,6 +479,38 @@ async def test_inv17_nothing_but_a_single_confirmation_precedes_the_commit_point
     assert eve.walked == [PAIRINGS_IID], (
         f"expected one confirming signature read of iid {PAIRINGS_IID}, got {eve.walked}"
     )
+
+
+async def test_inv17_the_cache_lookup_addresses_the_primary_accessory():
+    """The wire carries no accessory id -- a write goes to a bare instance id --
+    so the lookup must select accessory 1 by aid, not whichever entry happens to
+    be first. A bridged map with a decoy in front makes the two differ."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=bridged_cached_map(decoy_iid=250))
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID], (
+        "M1 went somewhere other than the primary accessory's Pairings characteristic"
+    )
+    assert eve.walked == [PAIRINGS_IID], (
+        "the wrong accessory was chosen and the mistake cost an enumeration to undo"
+    )
+
+
+async def test_inv17_a_cached_characteristic_that_cannot_be_written_is_not_used():
+    """A cache can be wrong about more than the instance id. Spending the one
+    request that matters on a read-only characteristic is not recoverable
+    inside any budget."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=read_only_cached_map())
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert eve.walked != [PAIRINGS_IID], (
+        "a Pairings characteristic without paired_write was trusted from the cache"
+    )
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
 
 
 async def test_inv17_an_unpair_without_a_cache_still_removes_the_pairing():

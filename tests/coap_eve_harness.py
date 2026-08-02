@@ -211,6 +211,54 @@ PAIRING_SERVICE_UUID = "00000055-0000-1000-8000-0026BB765291"
 PAIRINGS_CHAR_UUID = "00000050-0000-1000-8000-0026BB765291"
 
 
+def _pairing_accessory(aid: int, pairings_iid: int, perms: list[str]) -> dict:
+    return {
+        "aid": aid,
+        "services": [
+            {
+                "iid": 16,
+                "type": PAIRING_SERVICE_UUID,
+                "characteristics": [
+                    {
+                        "iid": pairings_iid,
+                        "type": PAIRINGS_CHAR_UUID,
+                        "perms": perms,
+                        "format": "tlv8",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def bridged_cached_map(decoy_iid: int = 250) -> dict:
+    """A map whose FIRST accessory is not the primary one.
+
+    HAP addresses the Pairing service on accessory 1, and the wire carries no
+    aid -- the write goes to a bare instance id. Reaching for accessories[0]
+    instead of aid 1 therefore writes a RemovePairing payload at whatever iid a
+    bridged accessory happens to use. Index-vs-aid is the transcription hazard
+    here, so the fixture makes the two differ.
+    """
+    return {
+        "config_num": -1,
+        "accessories": [
+            _pairing_accessory(2, decoy_iid, ["pr", "pw"]),
+            _pairing_accessory(1, PAIRINGS_IID, ["pr", "pw"]),
+        ],
+    }
+
+
+def read_only_cached_map() -> dict:
+    """A cached Pairings characteristic that cannot be written.
+
+    A cache can be wrong about more than the instance id. Writing M1 to a
+    characteristic the accessory will not accept a write on wastes the one
+    request that matters.
+    """
+    return {"config_num": -1, "accessories": [_pairing_accessory(1, PAIRINGS_IID, ["pr"])]}
+
+
 def cached_map(pairings_iid: int = PAIRINGS_IID, config_num: int = -1) -> dict:
     """An entity map of the shape a controller restores before a removal.
 
