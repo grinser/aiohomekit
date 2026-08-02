@@ -1211,7 +1211,7 @@ class CoAPHomeKitConnection:
             and _shorten_type(int.from_bytes(sig.service_type, "little")) == _PAIRING_SERVICE
         )
 
-    async def _pairings_iid(self, verify_attempts: int = 1) -> int:
+    async def _pairings_iid(self) -> int:
         """Locate the Pairing service's Pairings characteristic.
 
         Order matters and is the whole fix: whatever is already enumerated,
@@ -1240,7 +1240,7 @@ class CoAPHomeKitConnection:
         # No cache, or it was stale. There is no way to remove the pairing
         # without finding the characteristic, so this path is allowed to be
         # slow -- it just has to be right.
-        await self.get_accessory_info(verify_attempts=verify_attempts)
+        await self.get_accessory_info()
         if self.info is not None and self.info.accessories:
             char = self.info.accessories[0].find_service_characteristic_by_type(
                 _PAIRING_SERVICE, _PAIRINGS_CHARACTERISTIC

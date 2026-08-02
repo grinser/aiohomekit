@@ -28,7 +28,7 @@ Facts that follow from that, which these tests pin down:
   config number exceeds ours (abstract.py:175), and ours is -1, so the pairing
   dialog would enumerate after all.
 * HA never calls `list_pairings`, so only `remove_pairing` matters for the
-  bounded pairing-service lookup in practice.
+  Pairings characteristic lookup in practice.
 """
 
 import pytest
