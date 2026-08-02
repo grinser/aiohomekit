@@ -392,12 +392,32 @@ class CoAPHomeKitConnection:
         # database is usable but must never be trusted as authoritative.
         self.database_from_walk = False
 
+    @property
+    def _session(self) -> EncryptionContext:
+        """The live session, or a disconnect the caller already handles.
+
+        Every request goes through here. `enc_ctx` is set to None by
+        reconnect_soon and do_pair_verify without holding anything, so a task
+        in flight when an endpoint change lands used to get
+        `AttributeError: 'NoneType' object has no attribute 'post'` -- which is
+        not in a controller's catch list, unlike AccessoryDisconnectedError.
+        The same shape was observed in production one level down, in post_bytes.
+        """
+        if (enc_ctx := self.enc_ctx) is None:
+            raise AccessoryDisconnectedError("No session")
+        return enc_ctx
+
     async def reconnect_soon(self):
-        if not self.enc_ctx:
+        if (enc_ctx := self.enc_ctx) is None:
             return
-        if self.is_connected:
-            await self.enc_ctx.coap_ctx.shutdown()
+        # Cleared before the shutdown, and on the context itself as well as on
+        # us: a task released from enc_ctx.lock after this would otherwise call
+        # request() on a shut-down Context, whose failure mode is not one of the
+        # two exceptions post_bytes converts into a clean disconnect.
         self.enc_ctx = None
+        coap_ctx, enc_ctx.coap_ctx = enc_ctx.coap_ctx, None
+        if coap_ctx is not None:
+            await coap_ctx.shutdown()
         # _pairing_data is kept: an endpoint change does not change the
         # credentials, and _reverify_session needs them to rebuild the session.
         # XXX can't .connect here w/o pairing_data
@@ -476,8 +496,12 @@ class CoAPHomeKitConnection:
         self._pairing_data = pairing_data
         if self.is_connected:
             logger.debug("Connecting to connected device?")
-            await self.enc_ctx.coap_ctx.shutdown()
-            self.enc_ctx = None
+            # Same ordering as reconnect_soon: clear first, then shut down, so
+            # nothing waiting on the old session's lock can use a dead Context.
+            enc_ctx, self.enc_ctx = self.enc_ctx, None
+            coap_ctx, enc_ctx.coap_ctx = enc_ctx.coap_ctx, None
+            if coap_ctx is not None:
+                await coap_ctx.shutdown()
 
         root = resource.Site()
         coap_client = await Context.create_server_context(root, bind=("::", 0))
@@ -631,7 +655,7 @@ class CoAPHomeKitConnection:
         for iid in range(1, max_iid + 1):
             if not self.is_connected:
                 raise AccessoryDisconnectedError(f"Session ended during the signature walk at iid {iid}")
-            result = await self.enc_ctx.post(
+            result = await self._session.post(
                 OpCode.CHAR_SIG_READ,
                 iid,
                 b"",
@@ -798,7 +822,7 @@ class CoAPHomeKitConnection:
         session_alive = True
         body = None
         try:
-            _, body = await self.enc_ctx.post(
+            _, body = await self._session.post(
                 OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=GATT_PROBE_TIMEOUT
             )
         except _PROBE_TRANSIENT_FAILURES:
@@ -910,7 +934,7 @@ class CoAPHomeKitConnection:
                 data = [b""] * len(iids)
 
                 # send the read requests
-                results = await self.enc_ctx.post_all(OpCode.CHAR_READ, iids, data)
+                results = await self._session.post_all(OpCode.CHAR_READ, iids, data)
 
                 for idx, result in enumerate(results):
                     if isinstance(result, bytes):
@@ -988,7 +1012,7 @@ class CoAPHomeKitConnection:
         ids = list(characteristics)
         iids = [int(aid_iid[1]) for aid_iid in characteristics]
         data = [b""] * len(iids)
-        pdu_results = await self.enc_ctx.post_all(OpCode.CHAR_READ, iids, data)
+        pdu_results = await self._session.post_all(OpCode.CHAR_READ, iids, data)
         return self._read_characteristics_exit(ids, pdu_results)
 
     def _write_characteristics_enter(self, ids_values: list[tuple[int, int, Any]]) -> list[bytearray]:
@@ -1041,7 +1065,7 @@ class CoAPHomeKitConnection:
         tlv_values = self._write_characteristics_enter(ids_values)
 
         # batch write
-        pdu_results = await self.enc_ctx.post_all(
+        pdu_results = await self._session.post_all(
             OpCode.CHAR_WRITE,
             [int(aid_iid_value[1]) for aid_iid_value in ids_values],
             tlv_values,
@@ -1073,7 +1097,7 @@ class CoAPHomeKitConnection:
     async def subscribe_to(self, ids: list[tuple[int, int]]):
         iids = [int(aid_iid[1]) for aid_iid in ids]
         data = [b""] * len(iids)
-        pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0B_SUBSCRIBE, iids, data)
+        pdu_results = await self._session.post_all(OpCode.UNK_0B_SUBSCRIBE, iids, data)
         return self._subscribe_to_exit(ids, pdu_results)
 
     def _unsubscribe_from_exit(
@@ -1104,7 +1128,7 @@ class CoAPHomeKitConnection:
             return {}
         iids = [int(aid_iid[1]) for aid_iid in ids]
         data = [b""] * len(iids)
-        pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
+        pdu_results = await self._session.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
         return self._unsubscribe_from_exit(ids, pdu_results)
 
     def _cached_pairings_iid(self) -> int | None:
@@ -1163,7 +1187,7 @@ class CoAPHomeKitConnection:
         the constants are the short HAP forms.
         """
         try:
-            _, body = await self.enc_ctx.post(
+            _, body = await self._session.post(
                 OpCode.CHAR_SIG_READ,
                 iid,
                 b"",
@@ -1236,14 +1260,14 @@ class CoAPHomeKitConnection:
             ]
         )
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
-        payload_len, payload = await self.enc_ctx.post(
+        payload_len, payload = await self._session.post(
             OpCode.CHAR_WRITE,
             pairings_iid,
             payload,
         )
         # XXX check response
 
-        payload_len, payload = await self.enc_ctx.post(
+        payload_len, payload = await self._session.post(
             OpCode.CHAR_READ,
             pairings_iid,
             b"",
@@ -1287,7 +1311,7 @@ class CoAPHomeKitConnection:
         # set: it is a BLE-transport write parameter, and this procedure
         # completes without it against real hardware.
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
-        result_len, result = await self.enc_ctx.post(
+        result_len, result = await self._session.post(
             OpCode.CHAR_WRITE,
             pairings_iid,
             payload,
@@ -1313,7 +1337,7 @@ class CoAPHomeKitConnection:
         # which is why the broad except below is deliberate.
         try:
             async with asyncio_timeout(REMOVE_PAIRING_M2_TIMEOUT):
-                _, result = await self.enc_ctx.post(
+                _, result = await self._session.post(
                     OpCode.CHAR_READ,
                     pairings_iid,
                     b"",

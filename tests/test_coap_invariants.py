@@ -740,3 +740,35 @@ async def test_an_unconfirmable_iid_is_still_used_rather_than_walked_for():
     assert eve.walked == [PAIRINGS_IID], (
         f"an unanswered confirmation triggered an enumeration: {eve.walked}"
     )
+
+
+async def test_a_request_after_an_endpoint_change_is_a_disconnect():
+    """reconnect_soon drops the session when zeroconf reports a new address.
+    A task already in flight then finds enc_ctx gone. That must read as a
+    retryable disconnect, not AttributeError -- which is the same shape as the
+    failure observed in production one level down, in post_bytes."""
+    eve = FakeEve()
+    conn = build_connection(eve)
+    conn.enc_ctx = eve
+
+    await conn.reconnect_soon()
+
+    with pytest.raises(AccessoryDisconnectedError):
+        await conn.read_characteristics([(1, 2)])
+
+
+async def test_a_dropped_session_leaves_no_usable_context_behind():
+    """Clearing the connection's reference is not enough: anything holding the
+    EncryptionContext itself -- a task waiting on its lock -- would otherwise
+    go on to call request() on a Context that has been shut down, whose failure
+    is not one of the two exceptions post_bytes turns into a clean disconnect."""
+    eve = FakeEve()
+    conn = build_connection(eve)
+    conn.enc_ctx = eve
+    context = conn.enc_ctx
+    transport = context.coap_ctx
+
+    await conn.reconnect_soon()
+
+    assert context.coap_ctx is None, "the dropped session still points at its transport"
+    assert transport.shutdown_calls == 1, "the transport was dropped without being shut down"

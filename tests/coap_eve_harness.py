@@ -81,6 +81,20 @@ def real_firmware_layout() -> dict[int, bytes]:
     return {int(iid): bytes.fromhex(body) for iid, body in fixture["signatures"].items()}
 
 
+class FakeCoapContext:
+    """Stands in for an aiocoap Context.
+
+    A bare object() used to be enough, which quietly meant no test could reach
+    a teardown path -- every one of them calls shutdown().
+    """
+
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 def value_body(raw: bytes) -> bytes:
     # bytes, not bytearray: real PDU bodies are slices of the decrypted response.
     return bytes(TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, raw)]))
@@ -368,7 +382,7 @@ def build_connection(
     conn._pairing_data = dict(PAIRING_DATA)
     conn.verify_attempts = 0
     if session:
-        eve.coap_ctx = object()
+        eve.coap_ctx = FakeCoapContext()
     remaining = {"n": sleepy_verifies}
 
     async def fake_pair_verify(pairing_data):
@@ -376,7 +390,7 @@ def build_connection(
         if remaining["n"] > 0:
             remaining["n"] -= 1
             raise asyncio.TimeoutError
-        eve.coap_ctx = object()
+        eve.coap_ctx = FakeCoapContext()
 
     conn.do_pair_verify = fake_pair_verify
     return conn
