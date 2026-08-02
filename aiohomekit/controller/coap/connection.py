@@ -37,6 +37,11 @@ from aiohomekit.exceptions import (
     EncryptionError,
     UnknownError,
 )
+from aiohomekit.model.characteristics import (
+    CharacteristicPermissions,
+    CharacteristicsTypes,
+)
+from aiohomekit.model.services import ServicesTypes
 from aiohomekit.protocol import (
     get_session_keys,
     perform_pair_setup_part1,
@@ -44,6 +49,7 @@ from aiohomekit.protocol import (
 )
 from aiohomekit.protocol.tlv import HAP_TLV, K_TLV_ERROR_NAMES, TLV
 from aiohomekit.utils import asyncio_timeout
+from aiohomekit.uuid import normalize_uuid
 
 from ..ble.structs import Characteristic as CharacteristicTLV
 from .pdu import (
@@ -93,21 +99,6 @@ GATT_PROBE_TIMEOUT = 20.0
 # range, and the database is only assumed to end after a long run of gaps.
 SIGNATURE_WALK_MAX_IID = 300
 SIGNATURE_WALK_MAX_MISSES = 25
-# Far enough to reach the Pairing service, which is all list_pairings and
-# remove_pairing need: HAP lays out an accessory's mandatory services first,
-# and on real Eve firmware the Pairings characteristic sits in the first few
-# instance ids. Above SIGNATURE_WALK_MAX_MISSES so a bounded read can still
-# terminate on the miss counter rather than always running to the bound.
-#
-# This narrows the unpair window rather than closing it (~76 s for a full walk
-# against ~40 s bounded, measured on an Eve Room; a controller may only wait a
-# few seconds): the real fix is not enumerating at all for pairing operations.
-PAIRING_SERVICE_MAX_IID = 32
-# 0x09 returns the entire database, which is the opposite of what a bounded
-# read wants, but it is one round-trip when it works. Give it a short window
-# rather than the full probe timeout: on firmware that drops it, the wait is
-# pure latency on an operation the controller is already timing.
-PAIRING_PROBE_TIMEOUT = 4.0
 # First accessory's instance id; bridges increment from here.
 COAP_ACCESSORY_IID = 1
 # Probing a contiguous iid range legitimately misses; not worth a warning.
@@ -119,6 +110,11 @@ _WALK_SKIPPABLE_STATUSES = frozenset(
 )
 # A second one of these marks the start of another accessory.
 _ACCESSORY_INFORMATION_SERVICE = 0x3E
+# Short forms, for lookups against a Pdu09Database (which reports base-range
+# types shortened). The model equivalents are ServicesTypes.PAIRING and
+# CharacteristicsTypes.PAIRING_PAIRINGS, used when reading the owner's cache.
+_PAIRING_SERVICE = 0x55
+_PAIRINGS_CHARACTERISTIC = 0x50
 # 0x09 reports base-range types in short form and lookups are written against
 # that, but signatures always carry the full 128-bit UUID.
 _HAP_BASE_UUID = uuid.UUID("00000000-0000-1000-8000-0026BB765291").int
@@ -255,23 +251,31 @@ class EncryptionContext:
 
     async def post_bytes(self, payload: bytes, timeout: float = DEFAULT_POST_TIMEOUT):
         async with self.lock:
+            # Captured once, deliberately. Concurrent callers are routine -- a
+            # config-changed enumeration runs while a pairing operation is in
+            # flight -- and any of them may null coap_ctx from under us.
+            # Re-reading self.coap_ctx after an await would reintroduce that
+            # race; teardown does not take this lock, so the local is what makes
+            # this safe, not the check.
+            if (coap_ctx := self.coap_ctx) is None:
+                raise AccessoryDisconnectedError("Session closed")
+
             payload = self.encrypt(payload)
 
             try:
                 request = Message(code=Code.POST, payload=payload, uri=self.uri)
                 async with asyncio_timeout(timeout):
-                    response = await self.coap_ctx.request(request).response
+                    response = await coap_ctx.request(request).response
             except (NetworkError, asyncio.TimeoutError):
                 logger.debug("%s: Did not receive a reply; end of session.", self.uri)
-                if self.coap_ctx:
-                    await self.coap_ctx.shutdown()
-                    self.coap_ctx = None
+                await coap_ctx.shutdown()
+                self.coap_ctx = None
                 raise AccessoryDisconnectedError("Request timeout")
 
             if response.code == Code.NOT_FOUND:
                 # maybe the accessory lost power or was otherwise rebooted
                 logger.debug("CoAP POST returned 404, our session is gone.")
-                await self.coap_ctx.shutdown()
+                await coap_ctx.shutdown()
                 self.coap_ctx = None
             elif response.code != Code.CHANGED:
                 logger.warning(f"CoAP POST returned unexpected code {response}")
@@ -763,21 +767,20 @@ class CoAPHomeKitConnection:
             aid += 1
         return Pdu09Database(_accessories=containers)
 
-    async def _probe_gatt_database(
-        self, *, timeout: float, may_latch: bool, verify_attempts: int = 1
-    ) -> Pdu09Database | None:
+    async def _probe_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database | None:
         """Try the 0x09 bulk read; return the database, or None to walk instead.
 
         Leaves a live session behind either way. Some Thread accessories (e.g.
         Eve Room, HA #167379) silently drop 0x09 *and* tear down the secured
         session, so whatever reads next has to pair-verify again first.
 
-        `may_latch` says whether a failure here is admissible evidence that the
-        accessory has no 0x09 at all. It is False whenever the probe was given
-        less than GATT_PROBE_TIMEOUT: a window sized to the caller's deadline
-        proves nothing about the accessory, and since _gatt_unsupported is never
-        cleared, latching on it would condemn an accessory that merely answers
-        slowly to a 300-request walk for the life of the connection.
+        The probe always gets the full GATT_PROBE_TIMEOUT, because a failure
+        here latches 0x09 off for the life of the connection and the flag is
+        never cleared. Timing it out early would condemn an accessory that
+        merely answers slowly to a 300-request walk forever -- which is why no
+        caller may ask for a shorter window. Pairing operations, which used to,
+        no longer probe at all: they resolve the one iid they need from the
+        owner's cache.
         """
         if self._gatt_unsupported:
             return None
@@ -785,7 +788,9 @@ class CoAPHomeKitConnection:
         session_alive = True
         body = None
         try:
-            _, body = await self.enc_ctx.post(OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=timeout)
+            _, body = await self.enc_ctx.post(
+                OpCode.UNK_09_READ_GATT, 0x0000, b"", timeout=GATT_PROBE_TIMEOUT
+            )
         except _PROBE_TRANSIENT_FAILURES:
             logger.debug("0x09 probe failed transiently; rebuilding without it this time")
             session_alive = False
@@ -793,8 +798,7 @@ class CoAPHomeKitConnection:
             # No reply at all is the signature of firmware that drops 0x09.
             logger.debug("0x09 not answered; will reconnect and rebuild without it")
             session_alive = False
-            if may_latch:
-                self._gatt_unsupported = True
+            self._gatt_unsupported = True
 
         if isinstance(body, (bytes, bytearray)):
             try:
@@ -814,7 +818,7 @@ class CoAPHomeKitConnection:
             # A status: the session is healthy. Only a definitive rejection
             # means the accessory lacks 0x09 -- busy or desynced is transient.
             logger.debug("0x09 returned status %r; rebuilding without it", body)
-            if may_latch and body in _GATT_UNSUPPORTED_STATUSES:
+            if body in _GATT_UNSUPPORTED_STATUSES:
                 self._gatt_unsupported = True
 
         if not session_alive:
@@ -825,9 +829,7 @@ class CoAPHomeKitConnection:
     async def _read_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database:
         """Read the whole accessory database, by 0x09 if the accessory has it
         and by signature walk if it does not."""
-        info = await self._probe_gatt_database(
-            timeout=GATT_PROBE_TIMEOUT, may_latch=True, verify_attempts=verify_attempts
-        )
+        info = await self._probe_gatt_database(verify_attempts)
         if info is not None:
             # 0x09 returns the whole database in one request, so unlike a walk
             # this is known complete.
@@ -1095,52 +1097,105 @@ class CoAPHomeKitConnection:
         pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
         return self._unsubscribe_from_exit(ids, pdu_results)
 
-    async def _lookup_pairings_characteristic(self, max_iid: int, verify_attempts: int = 1):
-        """Find the Pairings characteristic with a read bounded to `max_iid`.
+    def _cached_pairings_iid(self) -> int | None:
+        """The Pairings characteristic's instance id, from the owner's database.
 
-        Deliberately does not go through get_accessory_info, and writes nothing
-        to self.info. Two things follow, and both are the point:
+        No I/O, and never raises. The controller restores this from its own
+        cache before it hands us the pairing -- a removal is always warm,
+        because a config entry cannot exist without an entity map behind it --
+        so the iid an unpair needs is already in memory before the first packet.
 
-        * It cannot be blocked. get_accessory_info holds the enumeration lock
-          for the length of a full walk, and an unpair that waits that out is
-          abandoned by the controller -- which leaves the pairing orphaned on
-          the accessory, needing a factory reset to clear.
-        * It cannot do damage. The database this builds is truncated by
-          construction, so making it self.info would hand every later read and
-          write a lookup table missing everything above the bound.
+        Note this reads a *model* Accessories, not self.info, which is a
+        Pdu09Database. Two object graphs, two attribute names (`iid` against
+        `instance_id`), and self.info is always None here: controllers build a
+        fresh pairing for removal precisely so no state is reused. Conflating
+        them is why this lookup used to go to the network for a value it held.
+
+        The BLE transport has resolved it this way for years; CoAP was the
+        outlier.
         """
-        database = await self._probe_gatt_database(
-            timeout=PAIRING_PROBE_TIMEOUT, may_latch=False, verify_attempts=verify_attempts
-        )
-        if database is None:
-            signatures, _ = await self._signature_walk(max_iid)
-            if not signatures:
-                return None
-            database = self._database_from_signatures(signatures)
-        if not database.accessories:
+        owner = self.owner
+        accessories = getattr(owner, "accessories", None) if owner is not None else None
+        if not accessories:
             return None
-        return database.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+        accessory = accessories.aid_or_none(COAP_ACCESSORY_IID)
+        if accessory is None:
+            return None
+        service = accessory.services.first(service_type=ServicesTypes.PAIRING)
+        if service is None:
+            return None
+        char = service.characteristics_by_type.get(normalize_uuid(CharacteristicsTypes.PAIRING_PAIRINGS))
+        if char is None or CharacteristicPermissions.paired_write not in char.perms:
+            return None
+        return char.iid
 
-    async def _pairings_characteristic(self):
+    async def _verify_pairings_iid(self, iid: int) -> bool:
+        """Confirm a cached iid still carries the Pairings characteristic.
+
+        One signature read. The cache can be stale -- a firmware update may
+        renumber instance ids, and walk-built databases are stored under a
+        config number the code itself treats as always-stale -- and this is the
+        one write that cannot simply be retried: a wrong iid that happens to be
+        writable would take a RemovePairing payload as a value.
+
+        Cheap enough to always pay: it turns every staleness objection into
+        "the check failed, enumerate instead".
+        """
+        try:
+            _, body = await self.enc_ctx.post(
+                OpCode.CHAR_SIG_READ, iid, b"", expected_statuses=_WALK_EXPECTED_STATUSES
+            )
+        except _PROBE_FAILURES + _PROBE_TRANSIENT_FAILURES:
+            return False
+        if not isinstance(body, (bytes, bytearray)):
+            return False
+        try:
+            sig = CharacteristicTLV.decode(bytes(body))
+        except Exception:
+            return False
+        if not sig.service_type:
+            return False
+        return (
+            _shorten_type(sig.type) == _PAIRINGS_CHARACTERISTIC
+            and _shorten_type(int.from_bytes(sig.service_type, "little")) == _PAIRING_SERVICE
+        )
+
+    async def _pairings_iid(self, verify_attempts: int = 1) -> int:
         """Locate the Pairing service's Pairings characteristic.
 
-        Prefers whatever has already been enumerated, then a bounded read, and
-        only then a full one. HAP lays an accessory's mandatory services out
-        first, so on real firmware the bounded read is the one that answers; the
-        full walk is there for the accessory that numbers them sparsely.
+        Order matters and is the whole fix: whatever is already enumerated,
+        then the controller's cache, and only then the network. Discovery here
+        is what an unpair cannot afford -- a controller abandons the removal
+        while a walk is still running, and an abandoned removal orphans the
+        pairing on the accessory, needing a factory reset to clear.
         """
         if self.info is not None and self.info.accessories:
-            char = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+            char = self.info.accessories[0].find_service_characteristic_by_type(
+                _PAIRING_SERVICE, _PAIRINGS_CHARACTERISTIC
+            )
             if char is not None:
-                return char
-        for bound in (PAIRING_SERVICE_MAX_IID, SIGNATURE_WALK_MAX_IID):
-            char = await self._lookup_pairings_characteristic(bound)
+                return char.instance_id
+
+        if (cached := self._cached_pairings_iid()) is not None:
+            if await self._verify_pairings_iid(cached):
+                logger.debug("Using the cached Pairings characteristic at iid %d", cached)
+                return cached
+            logger.debug("Cached Pairings iid %d no longer matches; enumerating", cached)
+
+        # No cache, or it was stale. There is no way to remove the pairing
+        # without finding the characteristic, so this path is allowed to be
+        # slow -- it just has to be right.
+        await self.get_accessory_info(verify_attempts=verify_attempts)
+        if self.info is not None and self.info.accessories:
+            char = self.info.accessories[0].find_service_characteristic_by_type(
+                _PAIRING_SERVICE, _PAIRINGS_CHARACTERISTIC
+            )
             if char is not None:
-                return char
+                return char.instance_id
         raise UnknownError("Accessory exposes no Pairing service")
 
     async def list_pairings(self):
-        pairings_characteristic = await self._pairings_characteristic()
+        pairings_iid = await self._pairings_iid()
 
         # list pairings M1
         m1_payload = TLV.encode_list(
@@ -1152,14 +1207,14 @@ class CoAPHomeKitConnection:
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
         payload_len, payload = await self.enc_ctx.post(
             OpCode.CHAR_WRITE,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             payload,
         )
         # XXX check response
 
         payload_len, payload = await self.enc_ctx.post(
             OpCode.CHAR_READ,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             b"",
         )
         # XXX check response
@@ -1187,7 +1242,7 @@ class CoAPHomeKitConnection:
         return list(zip(id_list, pk_list, pr_list))
 
     async def remove_pairing(self, pairing_id) -> bool:
-        pairings_characteristic = await self._pairings_characteristic()
+        pairings_iid = await self._pairings_iid()
 
         # remove pairings M1
         m1_payload = TLV.encode_list(
@@ -1203,7 +1258,7 @@ class CoAPHomeKitConnection:
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
         result_len, result = await self.enc_ctx.post(
             OpCode.CHAR_WRITE,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             payload,
         )
 
@@ -1229,7 +1284,7 @@ class CoAPHomeKitConnection:
             async with asyncio_timeout(REMOVE_PAIRING_M2_TIMEOUT):
                 _, result = await self.enc_ctx.post(
                     OpCode.CHAR_READ,
-                    pairings_characteristic.instance_id,
+                    pairings_iid,
                     b"",
                 )
         except Exception as exc:

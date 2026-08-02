@@ -13,11 +13,12 @@ import asyncio
 import struct
 
 import pytest
+from aiocoap.error import NetworkError as AiocoapNetworkError
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from aiohomekit.controller.coap.connection import (
+    DEFAULT_POST_TIMEOUT,
     GATT_PROBE_TIMEOUT,
-    PAIRING_PROBE_TIMEOUT,
-    PAIRING_SERVICE_MAX_IID,
     SIGNATURE_WALK_MAX_IID,
 )
 from aiohomekit.controller.coap.structs import Pdu09Database
@@ -47,32 +48,27 @@ def _no_retry_backoff(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-async def test_inv1_a_short_probe_may_not_latch_0x09_off():
-    """A bounded read gives 0x09 a short window because the caller is in a
-    hurry. Latching on that window condemns an accessory that merely answers
-    slowly to a 300-request walk for the life of the connection -- which the
-    constant's own comment says must not happen.
-
-    Driven through remove_pairing, the entry point that actually issues the
-    bounded read, so the invariant is asserted against the real path."""
-    eve = FakeEve(gatt="dropped")
-    conn = build_connection(eve)
-
-    assert await conn.remove_pairing("some-controller-id") is True
-
-    assert eve.probes == [PAIRING_PROBE_TIMEOUT], "the bounded read must use the short probe"
-    assert not conn._gatt_unsupported, (
-        "a probe given less than GATT_PROBE_TIMEOUT proves nothing about capability"
-    )
+# INV-1 previously had a second half: "a probe given a short window may not
+# latch". Its precondition no longer exists -- the bounded pairing read that
+# asked for 4 s is gone, pairing operations resolve their one iid from the
+# owner's cache, and the probe takes no timeout argument for a caller to
+# shorten. What remains is that the single window it does use is generous
+# enough that failing it means something.
 
 
-async def test_inv1_a_full_probe_may_latch_0x09_off():
+async def test_inv1_the_probe_gets_a_generous_window_before_it_latches():
+    """The flag is never cleared, so a timeout here condemns the accessory to a
+    300-request walk for the life of the connection. That is only defensible if
+    the probe waited at least as long as any ordinary request would."""
     eve = FakeEve(gatt="dropped")
     conn = build_connection(eve)
 
     await conn.get_accessory_info()
 
-    assert eve.probes == [GATT_PROBE_TIMEOUT]
+    assert eve.probes == [GATT_PROBE_TIMEOUT], "the probe used something other than its own timeout"
+    assert GATT_PROBE_TIMEOUT >= DEFAULT_POST_TIMEOUT, (
+        "an accessory that answers a large database slowly is supported, not broken"
+    )
     assert conn._gatt_unsupported
 
 
@@ -144,10 +140,10 @@ def _iids(database) -> set[int]:
     return {c.instance_id for a in database.accessories for s in a.services for c in s.characteristics}
 
 
-async def test_inv5_a_bounded_read_never_replaces_the_operating_database():
-    """A pairing operation must never disturb an enumerated database. The bound
-    (32) sits below the highest characteristic (59), so a truncated database
-    reaching self.info would be detectable as a missing iid."""
+async def test_inv5_a_pairing_operation_never_disturbs_the_operating_database():
+    """The operating database is the lookup table for every later read and
+    write. A pairing operation resolves one iid; it has no business replacing
+    it."""
     eve = FakeEve()
     conn = build_connection(eve)
 
@@ -157,21 +153,20 @@ async def test_inv5_a_bounded_read_never_replaces_the_operating_database():
 
     assert await conn.remove_pairing("some-controller-id") is True
 
-    assert conn.info is before, "a bounded read must not replace the operating database"
-    assert 59 in _iids(conn.info), "a bounded read must not downgrade an already-complete database"
+    assert conn.info is before, "a pairing operation replaced the operating database"
+    assert 59 in _iids(conn.info), "a pairing operation downgraded a complete database"
 
 
-async def test_inv5_a_bounded_read_installs_no_database_of_its_own():
-    """The same invariant from the other side: with nothing enumerated yet, a
-    pairing operation must leave self.info untouched rather than installing the
-    truncated database it built to find the one characteristic it needed."""
+async def test_inv5_a_cache_served_unpair_publishes_no_database():
+    """Served from the owner's cache, an unpair touches no database at all --
+    neither reading one nor installing one. The cached map is a model
+    Accessories; self.info is a Pdu09Database, and it stays empty."""
     eve = FakeEve()
-    conn = build_connection(eve)
+    pairing = build_pairing(eve, cached_accessories=cached_map())
 
-    assert await conn.remove_pairing("some-controller-id") is True
+    assert await pairing.remove_pairing("some-controller-id") is True
 
-    assert conn.info is None, "the bounded read published its truncated database"
-    assert max(eve.walked) <= PAIRING_SERVICE_MAX_IID, "the read must stop at the bound"
+    assert pairing.connection.info is None, "a cache-served unpair published a database"
 
 
 # --------------------------------------------------------------------------
@@ -239,9 +234,14 @@ async def test_inv8_remove_pairing_does_not_wait_for_a_full_enumeration():
 
     A blocked full walk is held open for the whole test; the unpair either
     completes without it or this fails. Nothing is awaited that could hang.
+
+    Stated for the warm case, which is the only one that occurs in the field: a
+    controller cannot delete a config entry without an entity map behind it. A
+    cold unpair has no source for the iid but the network, so it is allowed to
+    queue -- there is nothing else it could do.
     """
     eve = FakeEve()
-    pairing = build_pairing(eve, session=True)
+    pairing = build_pairing(eve, session=True, cached_accessories=cached_map())
     conn = pairing.connection
 
     walk_started = asyncio.Event()
@@ -326,7 +326,7 @@ async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration(
     together.
     """
     eve = FakeEve()
-    pairing = build_pairing(eve)
+    pairing = build_pairing(eve, cached_accessories=cached_map())
     conn = pairing.connection
 
     verify_started = asyncio.Event()
@@ -375,6 +375,50 @@ async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration(
 
 
 # --------------------------------------------------------------------------
+# INV-12b: a dead session surfaces as a disconnect, never as AttributeError
+# --------------------------------------------------------------------------
+
+
+async def test_a_request_on_a_closed_session_raises_a_disconnect():
+    """Observed in production during an unpair: the background enumeration a
+    controller schedules raced the removal, the removal's probe tore the session
+    down, and the enumeration hit `'NoneType' object has no attribute 'request'`.
+    AttributeError is not in a controller's catch list, so it surfaces as an
+    unhandled task error rather than a retryable disconnect."""
+    key = ChaCha20Poly1305(b"\x00" * 32)
+    ctx = connection_module.EncryptionContext(key, key, key, "coap://[::1]/", coap_ctx=None)
+
+    with pytest.raises(AccessoryDisconnectedError):
+        await ctx.post_bytes(b"\x00\x01\x02")
+
+
+async def test_a_session_torn_down_mid_request_raises_a_disconnect():
+    """The check alone is not enough: teardown does not take the context's lock,
+    so a coap_ctx re-read after the await would still race. The request must be
+    issued against the reference captured before it."""
+    key = ChaCha20Poly1305(b"\x00" * 32)
+
+    class Torn:
+        def request(self, message):
+            ctx.coap_ctx = None  # a concurrent teardown lands here
+
+            class _Pending:
+                @property
+                async def response(self):
+                    raise AiocoapNetworkError("gone")
+
+            return _Pending()
+
+        async def shutdown(self):
+            return None
+
+    ctx = connection_module.EncryptionContext(key, key, key, "coap://[::1]/", coap_ctx=Torn())
+
+    with pytest.raises(AccessoryDisconnectedError):
+        await ctx.post_bytes(b"\x00\x01\x02")
+
+
+# --------------------------------------------------------------------------
 # INV-17: what a pairing operation may COST
 # --------------------------------------------------------------------------
 #
@@ -389,12 +433,11 @@ async def test_inv8_remove_pairing_does_not_wait_on_a_pairing_level_enumeration(
 # 10 s and 45 s on the same device with no code change. So the requirement is
 # not "be fast enough", it is "make the write the next thing on the wire".
 
-# 1 pair-verify + M1 write + M2 read. The signature pre-check of a cached iid,
-# when added, makes it 4.
-REMOVE_PAIRING_MAX_REQUESTS = 2
+# One signature read to confirm the cached iid, then M1 write and M2 read.
+REMOVE_PAIRING_MAX_REQUESTS = 3
 
 
-async def test_inv17_an_unpair_served_from_cache_costs_two_round_trips():
+async def test_inv17_an_unpair_served_from_cache_costs_three_round_trips():
     """A warm pairing already holds the Pairings characteristic's instance id --
     the controller restored it from the entity map before handing us the
     pairing. Rediscovering it over the air is the whole defect."""
@@ -404,7 +447,6 @@ async def test_inv17_an_unpair_served_from_cache_costs_two_round_trips():
     assert await pairing.remove_pairing("some-controller-id") is True
 
     assert eve.probes == [], "an unpair probed 0x09"
-    assert eve.walked == [], "an unpair enumerated an accessory it already had a map for"
     assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
     assert eve.reads == [PAIRINGS_IID]
     assert eve.total_requests() <= REMOVE_PAIRING_MAX_REQUESTS, (
@@ -413,18 +455,27 @@ async def test_inv17_an_unpair_served_from_cache_costs_two_round_trips():
     )
 
 
-async def test_inv17_nothing_speculative_precedes_the_commit_point():
-    """Stated as a separate property because it is the one that actually bit:
-    the probe and the walk were both 'correct', and both ran before the only
-    request that changes anything on the accessory."""
+async def test_inv17_nothing_but_a_single_confirmation_precedes_the_commit_point():
+    """Stated separately because it is the property that actually bit: the probe
+    and the walk were both 'correct', and both ran before the only request that
+    changes anything on the accessory.
+
+    Exactly one request may precede the write, and it must be a signature read
+    *of the cached iid* -- that is the difference between confirming a cached
+    answer and searching for one. A walk would show up here as many reads, or as
+    a read of an iid nobody predicted.
+    """
     eve = FakeEve()
     pairing = build_pairing(eve, cached_accessories=cached_map())
 
     await pairing.remove_pairing("some-controller-id")
 
-    assert eve.requests_before_first_write() == 0, (
-        "requests were issued before RemovePairing M1; everything before the "
-        "commit point is discovery the caller is paying for"
+    assert eve.requests_before_first_write() == 1, (
+        f"{eve.requests_before_first_write()} requests preceded RemovePairing M1; "
+        "everything before the commit point is discovery the caller is paying for"
+    )
+    assert eve.walked == [PAIRINGS_IID], (
+        f"expected one confirming signature read of iid {PAIRINGS_IID}, got {eve.walked}"
     )
 
 
