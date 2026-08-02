@@ -253,3 +253,19 @@ def id_factory():
         return id_counter
 
     yield _get_id
+
+
+@pytest.fixture(autouse=True)
+def reset_gatt_unsupported_latch():
+    """Keep the process-wide 0x09 verdict from coupling tests.
+
+    CoAPHomeKitConnection latches "this accessory does not answer 0x09" per
+    device id rather than per connection, deliberately -- see the class
+    attribute. The harness reuses one device id, so without this a test that
+    latches would silently decide the outcome of every test after it.
+    """
+    from aiohomekit.controller.coap.connection import CoAPHomeKitConnection
+
+    CoAPHomeKitConnection._gatt_unsupported_devices.clear()
+    yield
+    CoAPHomeKitConnection._gatt_unsupported_devices.clear()

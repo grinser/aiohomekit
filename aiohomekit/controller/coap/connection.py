@@ -363,6 +363,25 @@ class EventResource(resource.Resource):
 
 
 class CoAPHomeKitConnection:
+    # Device ids whose firmware has been observed to drop 0x09, keyed by HAP
+    # pairing id. Deliberately class-scoped: whether an accessory answers 0x09
+    # is a property of the accessory, not of any one connection object.
+    #
+    # The per-instance flag this replaces was worthless to a removal. HA builds
+    # a fresh pairing -- and so a fresh, unlatched connection -- for every
+    # unpair, and the zeroconf description that arrives with it schedules a
+    # background _process_config_changed. Measured 2026-08-02: that enumeration
+    # probed 0x09, held the request lock for the full 20.002 s
+    # GATT_PROBE_TIMEOUT, then tore the session down, so remove_pairing's write
+    # was never sent and the accessory was left paired while HA reported
+    # success. remove_pairing itself already connects with
+    # enumerate_database=False; it was the concurrent enumerator that had to be
+    # taught what the rest of the process already knew.
+    #
+    # Never cleared, for the same reason the instance flag never was:
+    # re-probing costs a timeout *and* tears the session down.
+    _gatt_unsupported_devices: set[str] = set()
+
     def __init__(self, owner, host, port):
         self.address = f"[{host}]:{port}"
         self.connection_lock = asyncio.Lock()
@@ -371,10 +390,8 @@ class CoAPHomeKitConnection:
         self.owner = owner
         self.pair_setup_client = None
         self._pairing_data = None
-        # Never cleared: re-probing costs a timeout *and* tears the session down
-        # again on affected firmware. Latching on a one-off failure only costs
-        # speed, since the walk is plain HAP and works on any accessory.
-        self._gatt_unsupported = False
+        # Fallback for connections whose owner has no id yet; see _device_id.
+        self._gatt_unsupported_here = False
         # Serialises pair-verify so a re-verify cannot race connect() and leave
         # one of two sessions unreferenced (and unclosed) on the accessory.
         self._verify_lock = asyncio.Lock()
@@ -800,6 +817,37 @@ class CoAPHomeKitConnection:
             )
             aid += 1
         return Pdu09Database(_accessories=containers)
+
+    @property
+    def _gatt_unsupported(self) -> bool:
+        """Should the 0x09 bulk read be skipped for this accessory?"""
+        if self._gatt_unsupported_here:
+            return True
+        device_id = self._device_id()
+        return device_id is not None and device_id in self._gatt_unsupported_devices
+
+    @_gatt_unsupported.setter
+    def _gatt_unsupported(self, value: bool) -> None:
+        if not value:
+            # Nothing clears the latch -- see the class attribute. A setter that
+            # silently ignored False would be a trap, so say so.
+            raise ValueError("0x09 support is never re-enabled once it has been ruled out")
+        # Always record it here, so a connection whose owner has no id yet still
+        # gets the old per-connection behaviour rather than none at all.
+        self._gatt_unsupported_here = True
+        device_id = self._device_id()
+        if device_id is not None:
+            self._gatt_unsupported_devices.add(device_id)
+
+    def _device_id(self) -> str | None:
+        """The accessory's pairing id, or None if it is not knowable yet.
+
+        CoAPPairing assigns self.connection before calling super().__init__,
+        which is what sets self.id -- so during construction the owner exists
+        but has no id. Absent rather than exceptional, hence the default.
+        """
+        owner = self.owner
+        return getattr(owner, "id", None) if owner is not None else None
 
     async def _probe_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database | None:
         """Try the 0x09 bulk read; return the database, or None to walk instead.
