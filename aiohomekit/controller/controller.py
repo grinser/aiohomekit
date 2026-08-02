@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
-from asyncio.log import logger
 from collections.abc import AsyncIterable
 from contextlib import AsyncExitStack
 
@@ -42,6 +42,9 @@ from ..exceptions import (
     TransportNotSupportedError,
 )
 from .abstract import AbstractController, AbstractPairing, TransportType
+
+
+logger = logging.getLogger(__name__)
 
 
 class Controller(AbstractController):
@@ -219,6 +222,7 @@ class Controller(AbstractController):
             raise AccessoryNotFoundError(f'Alias "{alias}" is not found.')
 
         pairing = self.aliases[alias]
+        removed = False
 
         try:
             try:
@@ -234,9 +238,38 @@ class Controller(AbstractController):
                 primary_pairing_id = pairing.pairing_data["iOSPairingId"]
 
                 await pairing.remove_pairing(primary_pairing_id)
+                removed = True
+            except BaseException:
+                # Deliberately BaseException, and deliberately re-raised.
+                #
+                # The finally blocks below discard our side of the pairing
+                # whatever happens, so a removal that did not reach the
+                # accessory leaves it still paired -- needing a factory reset
+                # before it can be used again -- while we forget about it. That
+                # must never be silent.
+                #
+                # CancelledError is the case this exists for: callers remove a
+                # pairing from inside an HTTP request handler, and a client that
+                # disconnects cancels it mid-flight. Cancellation is not an
+                # error anyone catches, so without this the user is told nothing
+                # at all. Re-raising keeps cancellation semantics intact.
+                logger.warning(
+                    "%s: the pairing was NOT removed from the accessory. It still holds the "
+                    "pairing and will need to be reset before it can be paired again",
+                    alias,
+                    exc_info=True,
+                )
+                raise
             finally:
                 await pairing.shutdown()
         finally:
             # Outer finally block to ensure that the pairing is removed
             # from the controller even if the shutdown fails.
-            self._char_cache.async_delete_map(pairing.id)
+            #
+            # The cached accessory map is kept when the removal did not
+            # complete: it holds the Pairings characteristic's instance id,
+            # which is what lets a retry go straight to the write instead of
+            # re-enumerating the accessory. Discarding it here would throw away
+            # the one thing that makes the retry affordable.
+            if removed:
+                self._char_cache.async_delete_map(pairing.id)

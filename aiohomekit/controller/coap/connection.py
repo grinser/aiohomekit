@@ -1353,7 +1353,17 @@ class CoAPHomeKitConnection:
         try:
             m2 = decode_list_pairings_response(result)
         except Exception as exc:
-            logger.debug("Remove pairing M2 undecodable (%r); the removal itself was accepted", exc)
+            # Distinct from the cases above: the accessory answered with a
+            # non-empty body that is not a pairing response. The removal still
+            # stands -- M1 was accepted at a characteristic confirmed to be the
+            # Pairings one just beforehand, which is what makes this leniency
+            # defensible -- but the reply is not what this procedure expects, so
+            # it is worth seeing rather than debug-only.
+            logger.warning(
+                "Remove pairing M2 was answered but could not be decoded (%r); "
+                "treating the removal as accepted because M1 was",
+                exc,
+            )
             return True
 
         # The accessory did answer: an explicit error in M2 is a real failure.
