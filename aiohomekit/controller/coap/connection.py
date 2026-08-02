@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 # Short: removing our own pairing ends the session, so this read often gets no
 # answer, and the caller should not wait a full request timeout to find out.
 REMOVE_PAIRING_M2_TIMEOUT = 4.0
+# Shorter still: this confirmation is the only request between the caller and
+# the RemovePairing write, and the caller is being timed by something outside
+# this library -- a controller's removal has been cancelled after as little as
+# 10 s. The default 16 s would on its own exceed that budget. An accessory that
+# cannot answer one signature read within this is not going to complete an
+# unpair either, and an unanswered confirmation is not treated as a failure.
+PAIRINGS_VERIFY_TIMEOUT = 2.0
 
 DEFAULT_POST_TIMEOUT = 16.0
 # A sleepy accessory frequently misses the first pair-verify. Retrying matters
@@ -1132,30 +1139,47 @@ class CoAPHomeKitConnection:
             return None
         return char.iid
 
-    async def _verify_pairings_iid(self, iid: int) -> bool:
+    async def _verify_pairings_iid(self, iid: int) -> bool | None:
         """Confirm a cached iid still carries the Pairings characteristic.
 
-        One signature read. The cache can be stale -- a firmware update may
-        renumber instance ids, and walk-built databases are stored under a
-        config number the code itself treats as always-stale -- and this is the
-        one write that cannot simply be retried: a wrong iid that happens to be
-        writable would take a RemovePairing payload as a value.
+        One signature read, under a short timeout because this is the only
+        request standing between the caller and the write, and the caller is
+        being timed by something outside our control.
 
-        Cheap enough to always pay: it turns every staleness objection into
-        "the check failed, enumerate instead".
+        Three outcomes, and the distinction matters:
+
+        * True  -- the accessory confirmed it.
+        * False -- the accessory answered, and this iid is something else. The
+          cache is wrong; go and enumerate.
+        * None  -- no usable answer. That says nothing about the cache, so it
+          must not be read as "the cache is wrong". The caller proceeds with
+          the cached iid: an iid that really is wrong gets rejected by the
+          write, which fails loudly and is reported, whereas falling back to a
+          300-request walk here is how the removal gets abandoned and the
+          pairing orphaned.
+
+        Note both comparisons shorten: a signature always carries the full
+        128-bit UUID (real firmware sends 0x500000100080000026bb765291), while
+        the constants are the short HAP forms.
         """
         try:
             _, body = await self.enc_ctx.post(
-                OpCode.CHAR_SIG_READ, iid, b"", expected_statuses=_WALK_EXPECTED_STATUSES
+                OpCode.CHAR_SIG_READ,
+                iid,
+                b"",
+                timeout=PAIRINGS_VERIFY_TIMEOUT,
+                expected_statuses=_WALK_EXPECTED_STATUSES,
             )
         except _PROBE_FAILURES + _PROBE_TRANSIENT_FAILURES:
-            return False
+            logger.debug("Could not confirm the cached Pairings iid %d; using it anyway", iid)
+            return None
         if not isinstance(body, (bytes, bytearray)):
+            # A status: the accessory answered and this is not the one.
             return False
         try:
             sig = CharacteristicTLV.decode(bytes(body))
         except Exception:
-            return False
+            return None
         if not sig.service_type:
             return False
         return (
@@ -1180,10 +1204,14 @@ class CoAPHomeKitConnection:
                 return char.instance_id
 
         if (cached := self._cached_pairings_iid()) is not None:
-            if await self._verify_pairings_iid(cached):
+            # Only a definitive contradiction discards the cache. An
+            # unanswerable confirmation is not evidence, and treating it as
+            # such would spend a walk -- the very cost this path exists to
+            # avoid -- on an accessory that is merely slow.
+            if await self._verify_pairings_iid(cached) is not False:
                 logger.debug("Using the cached Pairings characteristic at iid %d", cached)
                 return cached
-            logger.debug("Cached Pairings iid %d no longer matches; enumerating", cached)
+            logger.debug("Cached Pairings iid %d is not the Pairings characteristic", cached)
 
         # No cache, or it was stale. There is no way to remove the pairing
         # without finding the characteristic, so this path is allowed to be

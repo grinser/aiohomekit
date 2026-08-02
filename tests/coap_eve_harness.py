@@ -100,6 +100,7 @@ class FakeEve:
 
         self.probes: list[float] = []
         self.walked: list[int] = []
+        self.sig_timeouts: list[float] = []
         self.writes: list[tuple[int, bytes]] = []
         self.reads: list[int] = []
         # Ordered log of every request, so a test can assert what an operation
@@ -153,6 +154,7 @@ class FakeEve:
 
         if opcode is OpCode.CHAR_SIG_READ:
             self.walked.append(iid)
+            self.sig_timeouts.append(timeout)
             if iid in self.layout:
                 body = self.layout[iid]
                 return (len(body), body)

@@ -10,16 +10,24 @@ a path the author had not modelled, which per-path tests cannot catch.
 from __future__ import annotations
 
 import asyncio
+import json
+import pathlib
 import struct
 
 import pytest
 from aiocoap.error import NetworkError as AiocoapNetworkError
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import (
     DEFAULT_POST_TIMEOUT,
     GATT_PROBE_TIMEOUT,
+    PAIRINGS_VERIFY_TIMEOUT,
+    REMOVE_PAIRING_M2_TIMEOUT,
     SIGNATURE_WALK_MAX_IID,
+    _PAIRING_SERVICE,
+    _PAIRINGS_CHARACTERISTIC,
+    _shorten_type,
 )
 from aiohomekit.controller.coap.structs import Pdu09Database
 from aiohomekit.exceptions import AccessoryDisconnectedError
@@ -526,12 +534,29 @@ async def test_inv17_an_unpair_without_a_cache_still_removes_the_pairing():
     assert eve.walked, "with no cache the iid has to come from somewhere"
 
 
-async def test_inv17_a_stale_cached_iid_does_not_silently_write_elsewhere():
-    """The risk the cache-first design takes on. A cached iid that no longer
-    holds the Pairings characteristic must not be written to and reported as a
-    successful unpair -- that is an orphan the user is told did not happen."""
+async def test_inv17_a_stale_cached_iid_that_exists_is_not_written_to():
+    """The dangerous stale case, and the reason the confirmation exists.
+
+    iid 41 is a real characteristic on this accessory (a humidity sensor), so
+    unlike an absent iid the accessory will happily accept a write to it and
+    answer the follow-up read. Without the confirmation, RemovePairing goes to
+    a sensor, M2 decodes, and the removal reports success -- an orphan the user
+    is told did not happen.
+    """
     eve = FakeEve()
-    # 250 is absent from EVE_LAYOUT, so the accessory rejects the write.
+    pairing = build_pairing(eve, cached_accessories=cached_map(pairings_iid=41))
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert 41 not in [iid for iid, _ in eve.writes], (
+        "RemovePairing was written to a sensor characteristic the cache misnamed"
+    )
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
+
+
+async def test_inv17_an_absent_stale_iid_never_reports_a_false_success():
+    """The other stale shape: the cached iid is not on the accessory at all."""
+    eve = FakeEve()
     pairing = build_pairing(eve, cached_accessories=cached_map(pairings_iid=250))
 
     try:
@@ -539,10 +564,29 @@ async def test_inv17_a_stale_cached_iid_does_not_silently_write_elsewhere():
     except Exception:
         return  # failing loudly is a correct outcome
 
-    assert removed is True, "reported failure is fine; reporting success is not"
-    assert [iid for iid, _ in eve.writes][-1] == PAIRINGS_IID, (
+    assert removed is True
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID], (
         "a stale cached iid was written to and the removal reported success"
     )
+
+
+def test_the_confirmation_accepts_a_real_firmware_signature():
+    """Signatures from a device carry the full 128-bit UUID; the constants
+    compared against are the short HAP forms. The harness encodes short ints,
+    so nothing else here exercises the shortening -- and dropping it would make
+    the confirmation reject every real accessory, sending every unpair down the
+    full-walk path this change exists to remove. Checked against the captured
+    Eve Room signature for iid 18."""
+    fixture = json.loads(
+        (pathlib.Path(__file__).parent / "fixtures" / "eve_room_signatures.json").read_text()
+    )
+    sig = CharacteristicTLV.decode(bytes.fromhex(fixture["signatures"][str(PAIRINGS_IID)]))
+
+    assert sig.type != _PAIRINGS_CHARACTERISTIC, (
+        "precondition: real firmware sends the full UUID, not the short form"
+    )
+    assert _shorten_type(sig.type) == _PAIRINGS_CHARACTERISTIC
+    assert _shorten_type(int.from_bytes(sig.service_type, "little")) == _PAIRING_SERVICE
 
 
 # --------------------------------------------------------------------------
@@ -647,4 +691,22 @@ async def test_the_event_path_still_decodes_once_the_database_is_there():
 
     assert events and events[0][(1, 41)]["value"] == 42, (
         "the value was reported undecoded despite a database being available"
+    )
+
+
+async def test_inv17_the_confirmation_cannot_outlast_the_removal_budget():
+    """The confirmation is the only request between the caller and the write,
+    and the caller is timed by something outside this library -- a removal has
+    been cancelled after as little as 10 s. post()'s 16 s default would exceed
+    that budget on its own."""
+    eve = FakeEve()
+    pairing = build_pairing(eve, cached_accessories=cached_map())
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert eve.sig_timeouts == [PAIRINGS_VERIFY_TIMEOUT], (
+        f"the confirmation ran under {eve.sig_timeouts}, not its own short timeout"
+    )
+    assert PAIRINGS_VERIFY_TIMEOUT < REMOVE_PAIRING_M2_TIMEOUT < DEFAULT_POST_TIMEOUT, (
+        "the requests on the critical path must be the most tightly bounded"
     )
