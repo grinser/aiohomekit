@@ -65,6 +65,22 @@ EVE_LAYOUT: dict[int, bytes] = {
 }
 
 
+def real_firmware_layout() -> dict[int, bytes]:
+    """The captured Eve Room signatures, which carry FULL 128-bit UUIDs.
+
+    signature() above encodes short ints, which is convenient but unlike any
+    real device -- so code that must shorten a type before comparing it looks
+    correct under the synthetic layout whether or not it actually shortens.
+    """
+    import json
+    import pathlib as _pathlib
+
+    fixture = json.loads(
+        (_pathlib.Path(__file__).parent / "fixtures" / "eve_room_signatures.json").read_text()
+    )
+    return {int(iid): bytes.fromhex(body) for iid, body in fixture["signatures"].items()}
+
+
 def value_body(raw: bytes) -> bytes:
     # bytes, not bytearray: real PDU bodies are slices of the decrypted response.
     return bytes(TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, raw)]))
@@ -86,6 +102,7 @@ class FakeEve:
         gatt_delay: float = 0.0,
         values: dict[int, bytes] | None = None,
         rtt: float = 0.5,
+        sig_failure: type[BaseException] | None = None,
     ):
         self.layout = EVE_LAYOUT if layout is None else layout
         self.gatt = gatt
@@ -93,6 +110,10 @@ class FakeEve:
         self.gatt_status = gatt_status
         self.gatt_delay = gatt_delay
         self.values = values or {}
+        # Raised by every CHAR_SIG_READ. Models an accessory that is reachable
+        # enough to pair-verify but drops the confirmation read -- the case
+        # where "no answer" must not be mistaken for "the cache is wrong".
+        self.sig_failure = sig_failure
         # Starts disconnected, exactly like a real context before pair-verify:
         # a harness that reports is_connected before anyone verified would make
         # every "did this path leave a usable session" check meaningless.
@@ -155,6 +176,8 @@ class FakeEve:
         if opcode is OpCode.CHAR_SIG_READ:
             self.walked.append(iid)
             self.sig_timeouts.append(timeout)
+            if self.sig_failure is not None:
+                raise self.sig_failure("no reply to the signature read")
             if iid in self.layout:
                 body = self.layout[iid]
                 return (len(body), body)

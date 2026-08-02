@@ -41,6 +41,7 @@ from .coap_eve_harness import (
     build_pairing,
     cached_map,
     read_only_cached_map,
+    real_firmware_layout,
     value_body,
 )
 
@@ -709,4 +710,33 @@ async def test_inv17_the_confirmation_cannot_outlast_the_removal_budget():
     )
     assert PAIRINGS_VERIFY_TIMEOUT < REMOVE_PAIRING_M2_TIMEOUT < DEFAULT_POST_TIMEOUT, (
         "the requests on the critical path must be the most tightly bounded"
+    )
+
+
+async def test_the_confirmation_accepts_a_real_device_signature():
+    """Driven through _verify_pairings_iid itself, against signatures captured
+    from hardware. The synthetic layout encodes short type ints, so code that
+    forgets to shorten a 128-bit UUID looks correct under it -- while on a real
+    accessory the confirmation would reject every device and send every unpair
+    down the full walk."""
+    eve = FakeEve(layout=real_firmware_layout())
+    conn = build_connection(eve)
+
+    assert await conn._verify_pairings_iid(PAIRINGS_IID) is True, (
+        "the confirmation rejected a signature captured from a real Eve Room"
+    )
+
+
+async def test_an_unconfirmable_iid_is_still_used_rather_than_walked_for():
+    """Silence is not evidence about the cache. Falling back to an enumeration
+    here is what gets a removal abandoned; writing to a cached iid that turns
+    out to be wrong fails loudly and is reported."""
+    eve = FakeEve(sig_failure=AccessoryDisconnectedError)
+    pairing = build_pairing(eve, cached_accessories=cached_map())
+
+    assert await pairing.remove_pairing("some-controller-id") is True
+
+    assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
+    assert eve.walked == [PAIRINGS_IID], (
+        f"an unanswered confirmation triggered an enumeration: {eve.walked}"
     )
