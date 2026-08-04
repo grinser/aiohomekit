@@ -34,8 +34,7 @@ def test_a_fresh_connection_inherits_the_verdict():
 
     second = build_pairing(eve, cached_accessories=cached_map())
     assert second.connection._gatt_unsupported, (
-        "a fresh pairing re-probes 0x09 -- this is what left the accessory "
-        "paired on 2026-08-02"
+        "a fresh pairing re-probes 0x09 -- this is what left the accessory paired on 2026-08-02"
     )
 
 

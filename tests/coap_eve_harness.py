@@ -366,9 +366,7 @@ class FakeController:
         self.discoveries = {}
 
 
-def build_connection(
-    eve: FakeEve, sleepy_verifies: int = 0, session: bool = True
-) -> CoAPHomeKitConnection:
+def build_connection(eve: FakeEve, sleepy_verifies: int = 0, session: bool = True) -> CoAPHomeKitConnection:
     """A connection wired to `eve`, whose pair-verify sleeps `sleepy_verifies` times.
 
     `session=True` starts with a live encrypted session, which is the state

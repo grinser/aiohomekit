@@ -81,9 +81,9 @@ async def test_a_failed_removal_warns_and_re_raises(outcome, caplog):
         with pytest.raises(type(outcome)):
             await controller.remove_pairing("alias")
 
-    assert any(
-        "NOT removed from the accessory" in record.message for record in caplog.records
-    ), f"a failed removal produced no warning; records={[r.message for r in caplog.records]}"
+    assert any("NOT removed from the accessory" in record.message for record in caplog.records), (
+        f"a failed removal produced no warning; records={[r.message for r in caplog.records]}"
+    )
     assert pairing.shutdown_called, "the pairing must still be shut down"
 
 

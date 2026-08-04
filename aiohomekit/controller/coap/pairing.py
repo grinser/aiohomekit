@@ -89,9 +89,7 @@ class CoAPPairing(ZeroconfPairing):
         """Returns how often the device should be polled."""
         return timedelta(minutes=1)
 
-    async def _ensure_connected(
-        self, pair_verify_attempts: int = 1, enumerate_database: bool = True
-    ):
+    async def _ensure_connected(self, pair_verify_attempts: int = 1, enumerate_database: bool = True):
         """Connect if needed.
 
         `pair_verify_attempts` is the retry budget handed to the connection.

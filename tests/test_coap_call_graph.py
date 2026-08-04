@@ -136,8 +136,10 @@ async def test_finish_pairing_hands_the_description_to_the_pairing():
     discovery.connection = type(
         "Conn",
         (),
-        {"do_pair_setup": staticmethod(fake_pair_setup),
-         "do_pair_setup_finish": staticmethod(fake_pair_setup_finish)},
+        {
+            "do_pair_setup": staticmethod(fake_pair_setup),
+            "do_pair_setup_finish": staticmethod(fake_pair_setup_finish),
+        },
     )()
 
     finish = await discovery.async_start_pairing("alias")

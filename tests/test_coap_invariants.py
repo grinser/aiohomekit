@@ -737,9 +737,7 @@ async def test_an_unconfirmable_iid_is_still_used_rather_than_walked_for():
     assert await pairing.remove_pairing("some-controller-id") is True
 
     assert [iid for iid, _ in eve.writes] == [PAIRINGS_IID]
-    assert eve.walked == [PAIRINGS_IID], (
-        f"an unanswered confirmation triggered an enumeration: {eve.walked}"
-    )
+    assert eve.walked == [PAIRINGS_IID], f"an unanswered confirmation triggered an enumeration: {eve.walked}"
 
 
 async def test_a_request_after_an_endpoint_change_is_a_disconnect():
