@@ -77,7 +77,14 @@ class CoAPPairing(ZeroconfPairing):
         """Returns how often the device should be polled."""
         return timedelta(minutes=1)
 
-    async def _ensure_connected(self):
+    async def _ensure_connected(self, enumerate_database: bool = True):
+        """Connect if needed.
+
+        `enumerate_database` is False for pairing operations, which need one
+        characteristic and locate it themselves. Note it only applies when this
+        coroutine is the one establishing the session; a caller that arrives
+        while a connection is already in progress still waits for it as before.
+        """
         # let in one coroutine at a time
         async with self.connection_lock:
             if self._shutdown:
@@ -89,7 +96,9 @@ class CoAPPairing(ZeroconfPairing):
             # if there isn't a connection in progress, we're in the driver's seat
             if self.connection_future is None:
                 # start a connection but don't await it here
-                self.connection_future = self.connection.connect(self.pairing_data)
+                self.connection_future = self.connection.connect(
+                    self.pairing_data, enumerate_database=enumerate_database
+                )
             else:
                 # we'll wait on the primary coroutine & copy how it returns
                 # this drops the lock and reacquires it when we're notified
@@ -227,7 +236,7 @@ class CoAPPairing(ZeroconfPairing):
         return await self.connection.unsubscribe_from(characteristics)
 
     async def list_pairings(self):
-        await self._ensure_connected()
+        await self._ensure_connected(enumerate_database=False)
         pairing_tuples = await self.connection.list_pairings()
         pairings = list(
             map(
@@ -245,7 +254,7 @@ class CoAPPairing(ZeroconfPairing):
         return pairings
 
     async def remove_pairing(self, pairingId: str) -> bool:
-        await self._ensure_connected()
+        await self._ensure_connected(enumerate_database=False)
         if await self.connection.remove_pairing(pairingId):
             await self._shutdown_if_primary_pairing_removed(pairingId)
             return True
