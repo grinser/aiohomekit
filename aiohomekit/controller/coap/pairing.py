@@ -164,10 +164,15 @@ class CoAPPairing(ZeroconfPairing):
 
         # Connected is not the same as ready: a session raised for a pairing
         # operation has no database behind it, and the next characteristic read
-        # dereferences info unguarded. Serialised by the connection's own
-        # enumeration lock, so two callers arriving together cost one walk.
+        # dereferences info unguarded. This check is racy by nature -- every
+        # waiter released by the primary sees info as None at the same moment --
+        # so the decision is re-taken under the enumeration lock, which is what
+        # makes two callers arriving together cost one enumeration rather than
+        # two.
         if enumerate_database and self.connection.info is None:
-            await self.connection.get_accessory_info(verify_attempts=pair_verify_attempts)
+            await self.connection.get_accessory_info(
+                verify_attempts=pair_verify_attempts, only_if_missing=True
+            )
 
         return
 

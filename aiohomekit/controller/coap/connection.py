@@ -106,6 +106,11 @@ GATT_PROBE_TIMEOUT = 20.0
 # range, and the database is only assumed to end after a long run of gaps.
 SIGNATURE_WALK_MAX_IID = 300
 SIGNATURE_WALK_MAX_MISSES = 25
+# Models whose firmware is known to drop 0x09, matched against the zeroconf
+# `md` record as a prefix. Deliberately a quirk rather than a capability: see
+# CoAPHomeKitConnection._walk_is_permitted. Not every Eve needs it -- Eve Energy
+# answers 0x09 -- which is why the match is only consulted once 0x09 has failed.
+_WALK_SUPPORTED_MODEL_PREFIX = "Eve"
 # First accessory's instance id; bridges increment from here.
 COAP_ACCESSORY_IID = 1
 # Probing a contiguous iid range legitimately misses; not worth a warning.
@@ -317,12 +322,18 @@ class EventResource(resource.Resource):
         self.connection = connection
 
     async def render_put(self, request):
+        # Teardown clears enc_ctx without taking any lock, and an event can
+        # arrive at any time -- including after reconnect_soon has run. Read it
+        # once into a local rather than dereferencing it three times.
+        enc_ctx = self.connection.enc_ctx
+        if enc_ctx is None:
+            logger.debug("Event arrived with no session; dropping it")
+            return Message(code=Code.NOT_FOUND)
+
         try:
-            payload = self.connection.enc_ctx.decrypt_event(request.payload)
+            payload = enc_ctx.decrypt_event(request.payload)
         except InvalidTag:
-            logger.debug(
-                "Event decryption failed, desynchronized? Counter=%d" % (self.connection.enc_ctx.event_ctr,)
-            )
+            logger.debug("Event decryption failed, desynchronized? Counter=%d" % (enc_ctx.event_ctr,))
             # XXX invalidate subscriptions, etc
             return Message(code=Code.NOT_FOUND)
 
@@ -849,6 +860,27 @@ class CoAPHomeKitConnection:
         owner = self.owner
         return getattr(owner, "id", None) if owner is not None else None
 
+    def _walk_is_permitted(self) -> bool:
+        """May this accessory be enumerated by signature walk?
+
+        Only firmware known to need it, matched on the model advertised over
+        zeroconf. The walk infers the end of the database from a run of missing
+        instance ids, and that inference is wrong for a sparsely numbered
+        accessory -- provably so against this repo's own 0x09 captures, which a
+        25-miss walk truncates from 36 characteristics to 26 (Nanoleaf bulb),
+        51 to 35 (WeMo Stage) and 86 to 16 (Schlage Encode Plus). The Eve
+        captures are numbered densely (iids 2..59) and survive it intact.
+
+        So the fallback cannot be offered generally without risking a silently
+        amputated database on an accessory that works today. It is consulted
+        only after 0x09 has already failed, which is what keeps an Eve that
+        does answer 0x09 -- test_decode_eve_energy in this repo is one -- on
+        the ordinary path.
+        """
+        description = getattr(self.owner, "description", None)
+        model = getattr(description, "model", None) if description is not None else None
+        return bool(model) and model.startswith(_WALK_SUPPORTED_MODEL_PREFIX)
+
     async def _probe_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database | None:
         """Try the 0x09 bulk read; return the database, or None to walk instead.
 
@@ -880,7 +912,12 @@ class CoAPHomeKitConnection:
             # No reply at all is the signature of firmware that drops 0x09.
             logger.debug("0x09 not answered; will reconnect and rebuild without it")
             session_alive = False
-            self._gatt_unsupported = True
+            # Only latch where the verdict can be acted on. A timeout is not
+            # proof that an accessory lacks 0x09 -- a congested mesh looks the
+            # same -- so on anything that cannot fall back to a walk, latching
+            # would turn one bad exchange into a permanently unreadable device.
+            if self._walk_is_permitted():
+                self._gatt_unsupported = True
 
         if isinstance(body, (bytes, bytearray)):
             try:
@@ -900,7 +937,7 @@ class CoAPHomeKitConnection:
             # A status: the session is healthy. Only a definitive rejection
             # means the accessory lacks 0x09 -- busy or desynced is transient.
             logger.debug("0x09 returned status %r; rebuilding without it", body)
-            if body in _GATT_UNSUPPORTED_STATUSES:
+            if body in _GATT_UNSUPPORTED_STATUSES and self._walk_is_permitted():
                 self._gatt_unsupported = True
 
         if not session_alive:
@@ -918,6 +955,12 @@ class CoAPHomeKitConnection:
             self.database_is_partial = False
             self.database_from_walk = False
             return info
+
+        if not self._walk_is_permitted():
+            # Every other accessory keeps the behaviour it has today: no 0x09,
+            # no database. See _walk_is_permitted for why the fallback is not
+            # offered generally.
+            raise AccessoryDisconnectedError("Accessory did not answer the 0x09 database read")
 
         logger.debug("Rebuilding accessory database via signature reads")
         signatures, walk_complete = await self._signature_walk()
@@ -943,16 +986,25 @@ class CoAPHomeKitConnection:
         """Force the next enumeration to re-read rather than reuse."""
         self.info = None
 
-    async def get_accessory_info(self, verify_attempts: int = 1):
+    async def get_accessory_info(self, verify_attempts: int = 1, only_if_missing: bool = False):
         """Read the accessory database and every readable value.
 
         `verify_attempts` is the pair-verify budget to use should the 0x09 probe
         drop the session; see _verify_with_retries.
+
+        `only_if_missing` is for callers that need a database to exist rather
+        than a fresh one. They must be coalesced: several can arrive together
+        on a reconnect, and each checked `info is None` before any of them took
+        this lock, so without the re-check below every one of them would
+        enumerate in turn.
         """
         async with self._enumeration_lock:
             if not self.is_connected:
                 # The wait can be long enough for the session to have gone away.
                 raise AccessoryDisconnectedError("Connection lost before enumerating")
+            if only_if_missing and self.info is not None:
+                logger.debug("Database was enumerated while we waited; not repeating it")
+                return self.info.to_dict()
             return await self._enumerate(verify_attempts)
 
     async def _enumerate(self, verify_attempts: int = 1):

@@ -97,7 +97,18 @@ def _connection(signatures):
     this file exercise the network route. Elsewhere the same construction was
     an accident that hid a defect for days, so it is spelled out.
     """
-    owner = type("Owner", (), {"accessories": None, "event_received": lambda *a: None})()
+    owner = type(
+        "Owner",
+        (),
+        {
+            "accessories": None,
+            "event_received": lambda *a: None,
+            # The signature-walk fallback is gated on the advertised model, so
+            # a walk-exercising owner has to look like the firmware that needs
+            # it. See CoAPHomeKitConnection._walk_is_permitted.
+            "description": type("Desc", (), {"model": "Eve Room 20EBX9901"})(),
+        },
+    )()
     conn = CoAPHomeKitConnection(owner, "::1", 5683)
     conn.enc_ctx = FakeEncryptionContext(signatures)
     conn._pairing_data = {"AccessoryPairingID": "AA:BB:CC:DD:EE:FF"}

@@ -228,11 +228,11 @@ class FakeEve:
         return [self.values.get(iid, PDUStatus.INVALID_REQUEST) for iid in iids]
 
 
-def description(config_num: int = 2, state_num: int = 1) -> HomeKitService:
+def description(config_num: int = 2, state_num: int = 1, model: str = "Eve Room 20EBX9901") -> HomeKitService:
     return HomeKitService(
         name=ADVERTISED_NAME,
         id=ACCESSORY_ID.lower(),
-        model="Eve Room 20EBX9901",
+        model=model,
         feature_flags=2,
         status_flags=0,
         config_num=config_num,
@@ -366,15 +366,32 @@ class FakeController:
         self.discoveries = {}
 
 
-def build_connection(eve: FakeEve, sleepy_verifies: int = 0, session: bool = True) -> CoAPHomeKitConnection:
+def build_connection(
+    eve: FakeEve,
+    sleepy_verifies: int = 0,
+    session: bool = True,
+    model: str | None = "Eve Room 20EBX9901",
+) -> CoAPHomeKitConnection:
     """A connection wired to `eve`, whose pair-verify sleeps `sleepy_verifies` times.
 
     `session=True` starts with a live encrypted session, which is the state
     every caller below connect() assumes. `session=False` starts genuinely
     disconnected, so a test can observe whether an entry point establishes one
     -- is_connected must never be true before a pair-verify has happened.
+
+    `model` is the zeroconf `md` string the signature-walk fallback is gated on.
+    It defaults to the accessory this harness models; pass another model, or
+    None for no zeroconf description at all, to drive the gate.
     """
-    owner = type("Owner", (), {"accessories": None, "event_received": lambda *a: None})()
+    owner = type(
+        "Owner",
+        (),
+        {
+            "accessories": None,
+            "event_received": lambda *a: None,
+            "description": description(model=model) if model is not None else None,
+        },
+    )()
     conn = CoAPHomeKitConnection(owner, "fdc8::1", 5683)
     conn.enc_ctx = eve
     conn._pairing_data = dict(PAIRING_DATA)
