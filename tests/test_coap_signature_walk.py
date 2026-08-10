@@ -13,6 +13,8 @@ import uuid
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import CoAPHomeKitConnection
 
+from .coap_eve_harness import fake_owner
+
 ACCESSORY_INFORMATION = 0x3E
 
 
@@ -27,7 +29,7 @@ def _sig(char_type, svc_type, svc_iid, fmt=0x04):
 
 
 def _conn():
-    owner = type("Owner", (), {"accessories": None, "event_received": lambda *a: None})()
+    owner = fake_owner()
     return CoAPHomeKitConnection(owner, "::1", 5683)
 
 

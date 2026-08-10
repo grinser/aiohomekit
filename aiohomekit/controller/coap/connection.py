@@ -413,8 +413,8 @@ class CoAPHomeKitConnection:
     #
     # Never cleared, for the same reason the instance flag never was:
     # re-probing costs a timeout *and* tears the session down.
-    _gatt_unsupported_devices: set[tuple[str, str]] = set()
-    # Consecutive unanswered probes per accessory, until one of them latches.
+    # Unanswered 0x09 probes per accessory. At GATT_UNSUPPORTED_CONFIRMATIONS
+    # the accessory is taken to lack the bulk read; see _gatt_unsupported.
     _gatt_probe_failures: dict[tuple[str, str], int] = {}
 
     def __init__(self, owner, host, port):
@@ -426,8 +426,7 @@ class CoAPHomeKitConnection:
         self.pair_setup_client = None
         self._pairing_data = None
         # Fallback for connections whose owner has no id yet; see _device_id.
-        self._gatt_unsupported_here = False
-        # Per-connection tally; see _record_ambiguous_probe_failure.
+        # Per-connection tally, used until the owner has an id; see _probe_failures.
         self._gatt_probe_failures_here = 0
         # Serialises pair-verify so a re-verify cannot race connect() and leave
         # one of two sessions unreferenced (and unclosed) on the accessory.
@@ -862,35 +861,58 @@ class CoAPHomeKitConnection:
     @property
     def _gatt_unsupported(self) -> bool:
         """Should the 0x09 bulk read be skipped for this accessory?"""
-        if self._gatt_unsupported_here:
-            return True
-        device_id = self._device_id()
-        return device_id is not None and device_id in self._gatt_unsupported_devices
+        return self._probe_failures >= GATT_UNSUPPORTED_CONFIRMATIONS
+
+    @property
+    def _probe_failures(self) -> int:
+        """Unanswered 0x09 probes for this accessory.
+
+        The shared tally is what carries a verdict across the fresh pairing a
+        controller builds for a removal. It needs a key, and a connection whose
+        owner has no id yet has none, so this connection's own count stands in.
+        """
+        key = self._device_id()
+        if key is None:
+            return self._gatt_probe_failures_here
+        return max(self._gatt_probe_failures_here, self._gatt_probe_failures.get(key, 0))
+
+    @_gatt_unsupported.setter
+    def _gatt_unsupported(self, value: bool) -> None:
+        """Record a definitive verdict: the accessory does not implement 0x09.
+
+        For evidence that settles the question on its own -- a rejection status
+        rather than silence. Ambiguous failures go through
+        _record_ambiguous_probe_failure, which needs more than one.
+        """
+        if not value:
+            # Clearing takes a reason, and there is exactly one: the accessory's
+            # configuration number changed. forget_gatt_verdict says so.
+            raise ValueError("use forget_gatt_verdict() to drop the 0x09 verdict")
+        self._set_probe_failures(GATT_UNSUPPORTED_CONFIRMATIONS)
+
+    def _set_probe_failures(self, count: int) -> None:
+        self._gatt_probe_failures_here = count
+        key = self._device_id()
+        if key is None:
+            return
+        if count:
+            self._gatt_probe_failures[key] = count
+        else:
+            self._gatt_probe_failures.pop(key, None)
 
     def _record_ambiguous_probe_failure(self) -> None:
         """Count an unanswered 0x09, and latch only once it has repeated.
 
-        A no-reply says nothing on its own. Requiring
-        GATT_UNSUPPORTED_CONFIRMATIONS of them costs one extra probe on
-        firmware that genuinely lacks 0x09, and saves a firmware that has it
-        from being walked for the life of the process because of one lost
-        packet. A definitive rejection does not come through here: that is
-        capability evidence and latches immediately.
+        A no-reply says nothing on its own: a lost packet, a congested mesh and
+        a sleeping accessory all look the same. Requiring
+        GATT_UNSUPPORTED_CONFIRMATIONS of them costs one extra probe on firmware
+        that genuinely lacks 0x09, and saves firmware that has it from being
+        walked for the life of the process because of one bad exchange.
         """
-        # Counted per connection as well as per accessory. The shared tally is
-        # what carries a verdict across the fresh pairing a removal builds, but
-        # it needs a key, and a connection whose owner has no id yet has none --
-        # counting only there would latch on the first failure, which is the
-        # thing this exists to prevent.
-        self._gatt_probe_failures_here += 1
-        seen = self._gatt_probe_failures_here
-        key = self._device_id()
-        if key is not None:
-            seen = max(seen, self._gatt_probe_failures.get(key, 0) + 1)
-            self._gatt_probe_failures[key] = seen
+        seen = self._probe_failures + 1
+        self._set_probe_failures(seen)
         if seen >= GATT_UNSUPPORTED_CONFIRMATIONS:
             logger.debug("0x09 unanswered %d times; treating it as unsupported", seen)
-            self._gatt_unsupported = True
         else:
             logger.debug(
                 "0x09 unanswered (%d of %d); walking this time but still probing next session",
@@ -906,25 +928,7 @@ class CoAPHomeKitConnection:
         update that gains -- or loses -- 0x09 produces. Without this the verdict
         outlives the firmware it was formed against, for the life of the process.
         """
-        key = self._device_id()
-        if key is not None:
-            self._gatt_unsupported_devices.discard(key)
-            self._gatt_probe_failures.pop(key, None)
-        self._gatt_unsupported_here = False
-        self._gatt_probe_failures_here = 0
-
-    @_gatt_unsupported.setter
-    def _gatt_unsupported(self, value: bool) -> None:
-        if not value:
-            # Nothing clears the latch -- see the class attribute. A setter that
-            # silently ignored False would be a trap, so say so.
-            raise ValueError("0x09 support is never re-enabled once it has been ruled out")
-        # Always record it here, so a connection whose owner has no id yet still
-        # gets the old per-connection behaviour rather than none at all.
-        self._gatt_unsupported_here = True
-        device_id = self._device_id()
-        if device_id is not None:
-            self._gatt_unsupported_devices.add(device_id)
+        self._set_probe_failures(0)
 
     def _device_id(self) -> tuple[str, str] | None:
         """The key the 0x09 verdict is remembered under, or None if unknowable.

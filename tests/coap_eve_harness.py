@@ -382,6 +382,23 @@ class FakeController:
         self.discoveries = {}
 
 
+def fake_owner(model: str | None = "Eve Room 20EBX9901", accessories=None, id: str | None = None):
+    """The bits of CoAPPairing a connection actually reaches for.
+
+    `model` is the zeroconf `md` string the signature-walk fallback is gated on;
+    None means no description at all. `id` is the accessory pairing id, absent
+    on a connection whose owner has not finished construction.
+    """
+    attrs = {
+        "accessories": accessories,
+        "event_received": lambda *a: None,
+        "description": description(model=model) if model is not None else None,
+    }
+    if id is not None:
+        attrs["id"] = id
+    return type("Owner", (), attrs)()
+
+
 def build_connection(
     eve: FakeEve,
     sleepy_verifies: int = 0,
@@ -399,15 +416,7 @@ def build_connection(
     It defaults to the accessory this harness models; pass another model, or
     None for no zeroconf description at all, to drive the gate.
     """
-    owner = type(
-        "Owner",
-        (),
-        {
-            "accessories": None,
-            "event_received": lambda *a: None,
-            "description": description(model=model) if model is not None else None,
-        },
-    )()
+    owner = fake_owner(model=model)
     conn = CoAPHomeKitConnection(owner, "fdc8::1", 5683)
     conn.enc_ctx = eve
     conn._pairing_data = dict(PAIRING_DATA)

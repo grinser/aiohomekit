@@ -28,6 +28,8 @@ from aiohomekit.controller.coap.pdu import OpCode, PDUStatus
 from aiohomekit.exceptions import AccessoryDisconnectedError, EncryptionError
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
+from .coap_eve_harness import fake_owner
+
 ACCESSORY_INFORMATION = 0x3E
 
 
@@ -96,17 +98,7 @@ class FakeEncryptionContext:
 
 
 def _connection(signatures, model="Eve Room 20EBX9901", **kwargs):
-    owner = type(
-        "Owner",
-        (),
-        {
-            "accessories": None,
-            "event_received": lambda *a: None,
-            # The fallback is gated on the advertised model; pass model=None to
-            # drive an accessory the walk must refuse to run on.
-            "description": (type("Desc", (), {"model": model})() if model is not None else None),
-        },
-    )()
+    owner = fake_owner(model=model)
     conn = CoAPHomeKitConnection(owner, "::1", 5683)
     conn.enc_ctx = FakeEncryptionContext(signatures, **kwargs)
     conn._pairing_data = {"AccessoryPairingID": "AA:BB:CC:DD:EE:FF"}

@@ -22,6 +22,8 @@ from aiohomekit.controller.coap.connection import (
 from aiohomekit.controller.coap.pairing import CoAPPairing
 from aiohomekit.exceptions import AccessoryDisconnectedError, AuthenticationError
 
+from .coap_eve_harness import fake_owner
+
 PAIRING_DATA = {"AccessoryPairingID": "AA:BB:CC:DD:EE:FF"}
 
 
@@ -32,7 +34,7 @@ def _no_retry_backoff(monkeypatch):
 
 
 def _connection():
-    owner = type("Owner", (), {"accessories": None, "event_received": lambda *a: None})()
+    owner = fake_owner()
     conn = CoAPHomeKitConnection(owner, "::1", 5683)
 
     async def no_enumeration(verify_attempts=1):

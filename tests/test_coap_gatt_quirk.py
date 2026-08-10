@@ -84,7 +84,7 @@ def test_without_an_owner_id_it_still_latches_locally():
     conn._gatt_unsupported = True
 
     assert conn._gatt_unsupported
-    assert not CoAPHomeKitConnection._gatt_unsupported_devices, (
+    assert not CoAPHomeKitConnection._gatt_probe_failures, (
         "an unidentified accessory must not be recorded process-wide"
     )
 
@@ -105,7 +105,7 @@ async def test_a_latched_accessory_costs_no_requests_and_no_timeout():
 
 def test_the_latch_is_not_shared_between_test_runs():
     """conftest clears it; without that, ordering would decide outcomes."""
-    assert not CoAPHomeKitConnection._gatt_unsupported_devices
+    assert not CoAPHomeKitConnection._gatt_probe_failures
 
 
 def test_the_verdict_does_not_survive_a_re_pairing():

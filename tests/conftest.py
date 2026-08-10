@@ -266,6 +266,6 @@ def reset_gatt_unsupported_latch():
     """
     from aiohomekit.controller.coap.connection import CoAPHomeKitConnection
 
-    CoAPHomeKitConnection._gatt_unsupported_devices.clear()
+    CoAPHomeKitConnection._gatt_probe_failures.clear()
     yield
-    CoAPHomeKitConnection._gatt_unsupported_devices.clear()
+    CoAPHomeKitConnection._gatt_probe_failures.clear()

@@ -33,6 +33,8 @@ from aiohomekit.controller.coap.pdu import OpCode, PDUStatus
 from aiohomekit.exceptions import AccessoryDisconnectedError, UnknownError
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 
+from .coap_eve_harness import fake_owner
+
 ACCESSORY_INFORMATION = 0x3E
 PAIRING_SERVICE = 0x55
 PAIRINGS_CHARACTERISTIC = 0x50
@@ -97,18 +99,7 @@ def _connection(signatures):
     this file exercise the network route. Elsewhere the same construction was
     an accident that hid a defect for days, so it is spelled out.
     """
-    owner = type(
-        "Owner",
-        (),
-        {
-            "accessories": None,
-            "event_received": lambda *a: None,
-            # The signature-walk fallback is gated on the advertised model, so
-            # a walk-exercising owner has to look like the firmware that needs
-            # it. See CoAPHomeKitConnection._walk_is_permitted.
-            "description": type("Desc", (), {"model": "Eve Room 20EBX9901"})(),
-        },
-    )()
+    owner = fake_owner()
     conn = CoAPHomeKitConnection(owner, "::1", 5683)
     conn.enc_ctx = FakeEncryptionContext(signatures)
     conn._pairing_data = {"AccessoryPairingID": "AA:BB:CC:DD:EE:FF"}
