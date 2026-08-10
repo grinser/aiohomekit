@@ -98,9 +98,8 @@ PAIR_VERIFY_ATTEMPTS = 3
 PAIR_VERIFY_RETRY_DELAY = 2.0
 # A deterministic rejection will not become a success on the third try.
 _PAIR_VERIFY_FATAL: tuple[type[BaseException], ...] = (AuthenticationError,)
-# A probe that times out latches 0x09 off for the life of the connection, so this
-# must stay at least as generous as post_bytes' default: an accessory that answers
-# a large database slowly is supported, not broken.
+# The probe must stay at least as generous as post_bytes' default: an accessory
+# that answers a large database slowly is supported, not broken.
 GATT_PROBE_TIMEOUT = 20.0
 # How many unanswered 0x09 probes before the accessory is taken to lack it.
 # One is ambiguous -- a lost packet looks the same -- and the model gate does
@@ -154,9 +153,8 @@ def _shorten_type(type_: int) -> int:
 
 # A fault in *this session*, not evidence about the accessory. The status branch
 # already draws that distinction -- busy or desynced is not "unsupported" -- and
-# the exception branch has to agree: _gatt_unsupported is never cleared, so
-# latching here would downgrade a capable accessory to a 300-request walk for
-# the life of the connection on the strength of one bad decrypt.
+# the exception branch has to agree: these never count towards the verdict at
+# all, however often they repeat.
 _PROBE_TRANSIENT_FAILURES: tuple[type[BaseException], ...] = (
     EncryptionError,
     AiocoapError,
@@ -411,8 +409,8 @@ class CoAPHomeKitConnection:
     # enumerate_database=False; it was the concurrent enumerator that had to be
     # taught what the rest of the process already knew.
     #
-    # Never cleared, for the same reason the instance flag never was:
-    # re-probing costs a timeout *and* tears the session down.
+    # Cleared only by forget_gatt_verdict, on a config-number change: re-probing
+    # costs a timeout *and* tears the session down, so it is not done idly.
     # Unanswered 0x09 probes per accessory. At GATT_UNSUPPORTED_CONFIRMATIONS
     # the accessory is taken to lack the bulk read; see _gatt_unsupported.
     _gatt_probe_failures: dict[tuple[str, str], int] = {}
@@ -696,7 +694,7 @@ class CoAPHomeKitConnection:
             raise AccessoryDisconnectedError("Cannot re-establish session: pairing data unavailable")
         await self._verify_with_retries(self._pairing_data, attempts)
 
-    async def _signature_walk(self, max_iid: int = SIGNATURE_WALK_MAX_IID) -> tuple[dict[int, bytes], bool]:
+    async def _signature_walk(self) -> tuple[dict[int, bytes], bool]:
         """Enumerate the accessory database by reading each characteristic's
         signature (0x01), used when 0x09 is unavailable. Invalid iids come back
         fast as a PDUStatus, so probing a contiguous range is cheap; stop after a
@@ -705,7 +703,7 @@ class CoAPHomeKitConnection:
         signatures: dict[int, bytes] = {}
         misses = 0
         complete = False
-        for iid in range(1, max_iid + 1):
+        for iid in range(1, SIGNATURE_WALK_MAX_IID + 1):
             if not self.is_connected:
                 raise AccessoryDisconnectedError(f"Session ended during the signature walk at iid {iid}")
             result = await self._session.post(
@@ -745,7 +743,7 @@ class CoAPHomeKitConnection:
                 )
                 complete = True
                 break
-        if not complete and max_iid == SIGNATURE_WALK_MAX_IID:
+        if not complete:
             # Ran out of range with no long gap: the accessory may have
             # characteristics above the scan limit that we are about to drop.
             logger.warning(
@@ -987,12 +985,10 @@ class CoAPHomeKitConnection:
         Eve Room, HA #167379) silently drop 0x09 *and* tear down the secured
         session, so whatever reads next has to pair-verify again first.
 
-        The probe always gets the full GATT_PROBE_TIMEOUT, because a failure
-        here latches 0x09 off for the life of the connection and the flag is
-        never cleared. Timing it out early would condemn an accessory that
-        merely answers slowly to a 300-request walk forever -- which is why no
-        caller may ask for a shorter window. Pairing operations, which used to,
-        no longer probe at all: they resolve the one iid they need from the
+        The probe always gets the full GATT_PROBE_TIMEOUT. Timing it out early
+        would count a slow answer towards the unsupported verdict, which is why
+        no caller may ask for a shorter window. Pairing operations, which used
+        to, no longer probe at all: they resolve the one iid they need from the
         owner's cache.
         """
         if self._gatt_unsupported:
@@ -1348,8 +1344,8 @@ class CoAPHomeKitConnection:
         fresh pairing for removal precisely so no state is reused. Conflating
         them is why this lookup used to go to the network for a value it held.
 
-        The BLE transport has resolved it this way for years; CoAP was the
-        outlier.
+        BLE resolves the same characteristic from the model too, though it does
+        so in its pairing rather than its connection -- see ble/pairing.py.
         """
         owner = self.owner
         # Direct attribute access, not getattr with a default: every owner is a

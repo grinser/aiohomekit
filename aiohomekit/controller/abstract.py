@@ -237,11 +237,17 @@ class AbstractPairing(metaclass=ABCMeta):
         self._accessories_state = AccessoriesState(accessories, config_num, broadcast_key, state_num)
         self._update_accessories_state_cache()
 
-    def _update_accessories_state_cache(self):
-        """Update the cache with the current state of the accessories."""
+    def _update_accessories_state_cache(self, config_num: int | None = None):
+        """Update the cache with the current state of the accessories.
+
+        `config_num` overrides what is persisted. A transport with a database it
+        cannot vouch for passes -1, this codebase's existing "no config number"
+        value, so a restart restores the entities and then re-reads before
+        trusting them.
+        """
         self.controller._char_cache.async_create_or_update_map(
             self.id,
-            self.config_num,
+            self.config_num if config_num is None else config_num,
             self.accessories.serialize(),
             serialize_broadcast_key(self.broadcast_key),
             self.state_num,

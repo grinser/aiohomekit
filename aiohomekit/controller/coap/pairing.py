@@ -26,7 +26,7 @@ from aiohomekit.exceptions import AccessoryDisconnectedError
 from aiohomekit.model import Accessories, AccessoriesState, Transport
 from aiohomekit.model.characteristics import CharacteristicPermissions
 from aiohomekit.protocol.statuscodes import HapStatusCode
-from aiohomekit.utils import async_create_task, serialize_broadcast_key
+from aiohomekit.utils import async_create_task
 from aiohomekit.uuid import normalize_uuid
 from aiohomekit.zeroconf import HomeKitService, ZeroconfPairing
 
@@ -222,25 +222,13 @@ class CoAPPairing(ZeroconfPairing):
             # restores entities from it and the first description update
             # re-reads for real.
             config_num = self.description.config_num if self.description else max(self.config_num, 0)
-            # Captured before the assignment below: AccessoriesState defaults
-            # both to None, so replacing the state first and reading them after
-            # would persist the defaults rather than what we hold.
-            broadcast_key, state_num = self.broadcast_key, self.state_num
             self._accessories_state = AccessoriesState(
-                Accessories.from_list(accessories), config_num, broadcast_key, state_num
+                Accessories.from_list(accessories), config_num, self.broadcast_key, self.state_num
             )
             logger.debug("%s: caching the signature-walk database as always-stale", self.name)
-            # Only the config number is the sentinel. The broadcast key and state
-            # number carry through: passing None cleared a stored state number,
-            # which is what a later catch-up poll compares against to decide
-            # whether it missed anything.
-            self.controller._char_cache.async_create_or_update_map(
-                self.id,
-                -1,
-                self.accessories.serialize(),
-                serialize_broadcast_key(broadcast_key),
-                state_num,
-            )
+            # Only the config number is the sentinel; everything else is what the
+            # shared helper would write.
+            self._update_accessories_state_cache(config_num=-1)
         else:
             # max(..., 0): with no prior state config_num reports -1, which is
             # reserved above as the walk's always-stale marker; an authoritative
@@ -289,7 +277,7 @@ class CoAPPairing(ZeroconfPairing):
         # is keyed on do not change across an update.
         self.connection.forget_gatt_verdict()
         await self.list_accessories_and_characteristics()
-        if self.connection.database_is_partial or self.connection.database_from_walk:
+        if self.connection.database_from_walk:
             # list_accessories_and_characteristics just declined to persist this
             # database as authoritative; stamping the accessory's real config
             # number here would overrule that and persist it as one. Listeners

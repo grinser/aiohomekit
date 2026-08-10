@@ -12,8 +12,10 @@ The behaviours modelled are the ones an Eve Room actually exhibits:
   so whatever runs next has to pair-verify again before it can read anything.
 * pair-verify is missed when the accessory is asleep, which it frequently is
   immediately after pair-setup -- the moment when giving up is most expensive.
-* instance ids are contiguous and modest (2..59, one gap run of 24), so a walk
-  terminates on the miss counter rather than the scan limit.
+* instance ids are contiguous and modest, so a walk terminates on the miss
+  counter rather than the scan limit. The captured Eve Room runs 2..59 with no
+  gap wider than 2 (tests/fixtures/eve_room_signatures.json); EVE_LAYOUT below
+  is synthetic and deliberately harsher, with a run of 22.
 
 `FakeEve` counts and gates each of those so a test can say "sleep through the
 first N pair-verifies" or "answer 0x09 slowly" and then drive any entry point.
