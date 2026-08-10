@@ -156,3 +156,28 @@ async def test_an_eve_that_drops_0x09_still_walks():
 
     assert conn.database_from_walk
     assert conn.info is not None
+
+
+async def test_a_walk_built_database_declares_no_linked_services():
+    """Known and accepted, not an oversight.
+
+    Linked services live on the service signature (0x06); the walk reads only
+    characteristic signatures (0x01), so it cannot see them. That costs nothing
+    on the accessories that can reach the walk: an Eve Room and an Eve Weather
+    were probed with SERV_SIG_READ across every service and declared none, and
+    the Eve Energy capture in this repo declares none either. The captures that
+    do use linked services -- WeMo Stage and Schlage Encode Plus -- cannot
+    reach the walk, because the gate keeps them on the 0x09 path.
+
+    If a future Eve needs them, SERV_SIG_READ recovers them for about one extra
+    request per service.
+    """
+    conn = build_connection(FakeEve(gatt="dropped"), model="Eve Room 20EBX9901")
+
+    await conn.get_accessory_info()
+
+    assert conn.database_from_walk
+    linked = [
+        service.linked_services for accessory in conn.info.accessories for service in accessory.services
+    ]
+    assert linked and not any(linked), "the walk cannot source linked services"
