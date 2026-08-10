@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
 from aiohomekit.controller.coap.connection import (
     DEFAULT_POST_TIMEOUT,
+    GATT_UNSUPPORTED_CONFIRMATIONS,
     GATT_PROBE_TIMEOUT,
     PAIRINGS_VERIFY_TIMEOUT,
     REMOVE_PAIRING_M2_TIMEOUT,
@@ -75,9 +76,11 @@ async def test_inv1_the_probe_gets_a_generous_window_before_it_latches():
     eve = FakeEve(gatt="dropped")
     conn = build_connection(eve)
 
-    await conn.get_accessory_info()
+    for _ in range(GATT_UNSUPPORTED_CONFIRMATIONS):
+        conn.invalidate_database()
+        await conn.get_accessory_info()
 
-    assert eve.probes == [GATT_PROBE_TIMEOUT], "the probe used something other than its own timeout"
+    assert set(eve.probes) == {GATT_PROBE_TIMEOUT}, "the probe used something other than its own timeout"
     assert GATT_PROBE_TIMEOUT >= DEFAULT_POST_TIMEOUT, (
         "an accessory that answers a large database slowly is supported, not broken"
     )

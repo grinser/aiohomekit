@@ -33,6 +33,10 @@ class FakeConnection:
         self.database_is_partial = partial
         self.database_from_walk = from_walk
         self.invalidated = False
+        self.verdict_forgotten = False
+
+    def forget_gatt_verdict(self):
+        self.verdict_forgotten = True
 
     async def get_accessory_info(self, verify_attempts=1):
         import copy
@@ -189,3 +193,22 @@ async def test_the_walk_cache_write_preserves_the_broadcast_key_and_state_number
     assert last["config_num"] == -1, "the walk's result is always stale by design"
     assert last["state_num"] == 7, f"state number was clobbered: stored {last['state_num']!r}"
     assert last["broadcast_key"] is not None, "broadcast key was clobbered"
+
+
+async def test_a_config_change_forgets_what_we_believe_about_0x09():
+    """Not just the database -- the capability verdict too.
+
+    HAP requires the config number to change whenever the attribute database
+    does, which is what a firmware update produces, including one that gains or
+    loses the bulk read. The credentials the verdict is keyed on do not change
+    across an update, so without this it outlives the firmware it was formed
+    against for the life of the process.
+
+    Asserted through _process_config_changed rather than by calling the method
+    directly: the wiring is the part that was missing.
+    """
+    pairing = _pairing(prior_config_num=1, from_walk=True)
+
+    await pairing._process_config_changed(9)
+
+    assert pairing.connection.verdict_forgotten, "a config-number change left the 0x09 verdict in place"

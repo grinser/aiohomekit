@@ -281,6 +281,13 @@ class CoAPPairing(ZeroconfPairing):
         """
         # The instance ids may have moved, so the cached database cannot be reused.
         self.connection.invalidate_database()
+        # And what we believe about 0x09 goes with it. HAP requires the config
+        # number to change on any change to the attribute database, which is
+        # what a firmware update produces -- including one that gains or loses
+        # the bulk read. Without this the verdict outlives the firmware it was
+        # formed against for the life of the process, since the credentials it
+        # is keyed on do not change across an update.
+        self.connection.forget_gatt_verdict()
         await self.list_accessories_and_characteristics()
         if self.connection.database_is_partial or self.connection.database_from_walk:
             # list_accessories_and_characteristics just declined to persist this

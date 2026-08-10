@@ -32,7 +32,10 @@ from __future__ import annotations
 
 import pytest
 
-from aiohomekit.controller.coap.connection import CoAPHomeKitConnection
+from aiohomekit.controller.coap.connection import (
+    GATT_UNSUPPORTED_CONFIRMATIONS,
+    CoAPHomeKitConnection,
+)
 from aiohomekit.controller.coap.pdu import PDUStatus
 from aiohomekit.controller.coap.structs import Pdu09Database
 from aiohomekit.exceptions import AccessoryDisconnectedError
@@ -195,3 +198,50 @@ async def test_a_walk_built_database_declares_no_linked_services():
         service.linked_services for accessory in conn.info.accessories for service in accessory.services
     ]
     assert linked and not any(linked), "the walk cannot source linked services"
+
+
+async def test_a_gated_model_is_not_condemned_by_one_unanswered_probe():
+    """The gate names a product, not a firmware capability.
+
+    A gated model whose firmware DOES implement 0x09 must survive an ambiguous
+    failure -- a lost packet, a congested mesh, a sleeping accessory all look
+    like silence. One of them falls back so the caller still gets a database,
+    but the verdict is not recorded, so the next session probes again.
+    """
+    eve = FakeEve(gatt="dropped")
+    conn = build_connection(eve, model="Eve Room 20EBX9901")
+
+    await conn.get_accessory_info()
+
+    assert conn.database_from_walk, "the caller still needs a database"
+    assert not conn._gatt_unsupported, (
+        "one unanswered probe latched 0x09 off; a firmware that has it would never be asked again"
+    )
+
+
+async def test_a_repeated_silence_does_settle_it():
+    """The counterpart: the latch must still happen, or every session pays the
+    full probe timeout on firmware that genuinely lacks 0x09."""
+    eve = FakeEve(gatt="dropped")
+    conn = build_connection(eve, model="Eve Room 20EBX9901")
+
+    for _ in range(GATT_UNSUPPORTED_CONFIRMATIONS):
+        conn.invalidate_database()
+        await conn.get_accessory_info()
+
+    assert conn._gatt_unsupported
+
+
+async def test_a_config_number_change_forgets_the_verdict():
+    """HAP requires the config number to change whenever the attribute database
+    does, which is what a firmware update produces. The credentials the verdict
+    is keyed on do not change across an update, so without this it outlives the
+    firmware it was formed against for the life of the process.
+    """
+    conn = build_connection(FakeEve(gatt="dropped"), model="Eve Room 20EBX9901")
+    conn._gatt_unsupported = True
+    assert conn._gatt_unsupported
+
+    conn.forget_gatt_verdict()
+
+    assert not conn._gatt_unsupported, "a firmware update cannot lift the verdict"

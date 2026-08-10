@@ -22,7 +22,7 @@ import pytest
 
 from aiohomekit.characteristic_cache import CharacteristicCacheMemory
 from aiohomekit.controller.controller import Controller
-from aiohomekit.exceptions import AccessoryDisconnectedError
+from aiohomekit.exceptions import AccessoryDisconnectedError, UnknownError
 
 
 class FakePairing:
@@ -84,7 +84,10 @@ async def test_a_failed_removal_warns_and_re_raises(outcome, caplog):
     assert any("NOT removed from the accessory" in record.message for record in caplog.records), (
         f"a failed removal produced no warning; records={[r.message for r in caplog.records]}"
     )
-    assert pairing.shutdown_called, "the pairing must still be shut down"
+    assert not pairing.shutdown_called, (
+        "a pairing that still exists on the accessory must stay usable; shutting it "
+        "down leaves the caller told to retry with nothing to retry on"
+    )
 
 
 async def test_a_failed_removal_keeps_the_cached_map():
@@ -122,3 +125,39 @@ async def test_the_warning_names_the_accessory_and_the_remedy():
     message = " ".join(record.getMessage() for record in records)
     assert "alias" in message
     assert "reset" in message.lower()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        asyncio.CancelledError(),
+        AccessoryDisconnectedError("gone"),
+        UnknownError("Remove pairing could not be confirmed"),
+    ],
+    ids=["cancelled", "disconnected", "unconfirmed"],
+)
+async def test_a_failed_removal_leaves_the_pairing_retryable(outcome):
+    """Telling the caller is necessary but not sufficient.
+
+    The pairing is dropped from aliases and pairings before the attempt, so that
+    a removal in flight stops receiving updates. If the attempt then fails and
+    those entries are not put back, the caller is told the accessory is still
+    paired and has nothing left to retry with -- the same orphan as before, with
+    a truthful exception in front of it.
+    """
+    pairing = FakePairing(outcome=outcome)
+    controller = _controller(pairing)
+
+    with pytest.raises(type(outcome)):
+        await controller.remove_pairing("alias")
+
+    assert controller.aliases.get("alias") is pairing, "the alias was not restored"
+    assert controller.pairings.get(pairing.id) is pairing, "the pairing was not restored"
+    assert not pairing.shutdown_called
+
+    # And the retry actually works once the accessory answers.
+    pairing.outcome = None
+    await controller.remove_pairing("alias")
+
+    assert pairing.removed
+    assert "alias" not in controller.aliases

@@ -18,6 +18,7 @@ from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTL
 from aiohomekit.controller.coap.connection import (
     DEFAULT_POST_TIMEOUT,
     GATT_PROBE_TIMEOUT,
+    GATT_UNSUPPORTED_CONFIRMATIONS,
     SIGNATURE_WALK_MAX_IID,
     SIGNATURE_WALK_MAX_MISSES,
     _WALK_EXPECTED_STATUSES,
@@ -163,10 +164,16 @@ async def test_every_probe_failure_falls_back_and_reconnects(error):
 @pytest.mark.parametrize("error", LATCHING_PROBE_ERRORS)
 async def test_no_reply_at_all_latches_0x09_off(error):
     """Silence, or a reply too mangled to be a PDU, is the signature of firmware
-    that does not implement 0x09."""
+    that does not implement 0x09 -- but only once it has repeated. A single
+    unanswered probe is ambiguous: a lost packet looks identical, and the model
+    gate does not settle it, since it names a product and not a firmware."""
     conn = _connection(DEVICE, gatt_error=error)
 
     await conn._read_gatt_database()
+    assert not conn._gatt_unsupported, "one ambiguous failure must not settle it"
+
+    for _ in range(GATT_UNSUPPORTED_CONFIRMATIONS - 1):
+        await conn._read_gatt_database()
 
     assert conn._gatt_unsupported
 
@@ -237,6 +244,15 @@ async def test_a_transient_status_does_not_latch_0x09_off(status):
     assert not conn._gatt_unsupported
 
 
+async def _latch(conn):
+    """Probe until the ambiguous-failure threshold is reached."""
+    for _ in range(GATT_UNSUPPORTED_CONFIRMATIONS):
+        try:
+            await conn._read_gatt_database()
+        except Exception:
+            pass
+
+
 async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
     """Latching must not depend on the walk succeeding.
 
@@ -250,8 +266,9 @@ async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
 
     conn._signature_walk = failing_walk
 
-    with pytest.raises(AccessoryDisconnectedError):
-        await conn._read_gatt_database()
+    # _latch swallows the walk failure; the point is that the verdict is
+    # recorded from the probe regardless of what the walk then does.
+    await _latch(conn)
 
     assert conn._gatt_unsupported
 
@@ -259,11 +276,12 @@ async def test_0x09_is_latched_off_even_if_the_walk_then_fails():
 async def test_probe_is_skipped_once_the_accessory_is_known_to_drop_it():
     conn = _connection(DEVICE)
 
-    await conn._read_gatt_database()
-    probes_after_first = conn.enc_ctx.probes
+    await _latch(conn)
+    probes_to_latch = conn.enc_ctx.probes
     await conn._read_gatt_database()
 
-    assert conn.enc_ctx.probes == probes_after_first == 1
+    assert probes_to_latch == GATT_UNSUPPORTED_CONFIRMATIONS
+    assert conn.enc_ctx.probes == probes_to_latch, "a latched accessory must not be probed again"
 
 
 async def test_undecodable_signatures_do_not_yield_an_empty_database():

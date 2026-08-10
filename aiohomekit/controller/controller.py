@@ -242,26 +242,36 @@ class Controller(AbstractController):
             except BaseException:
                 # Deliberately BaseException, and deliberately re-raised.
                 #
-                # The finally blocks below discard our side of the pairing
-                # whatever happens, so a removal that did not reach the
-                # accessory leaves it still paired -- needing a factory reset
-                # before it can be used again -- while we forget about it. That
-                # must never be silent.
+                # A removal that did not reach the accessory leaves it still
+                # paired. Telling the caller is necessary but not sufficient:
+                # the pairing was removed from our own maps before the attempt,
+                # so without putting it back the caller is told to retry and has
+                # nothing left to retry with. Restoring it is what makes the
+                # exception actionable rather than merely honest.
                 #
                 # CancelledError is the case this exists for: callers remove a
                 # pairing from inside an HTTP request handler, and a client that
                 # disconnects cancels it mid-flight. Cancellation is not an
                 # error anyone catches, so without this the user is told nothing
                 # at all. Re-raising keeps cancellation semantics intact.
+                self.aliases[alias] = pairing
+                pairing.controller.aliases[alias] = pairing
+                self.pairings[pairing.id] = pairing
+                pairing.controller.pairings[pairing.id] = pairing
                 logger.warning(
                     "%s: the pairing was NOT removed from the accessory. It still holds the "
-                    "pairing and will need to be reset before it can be paired again",
+                    "pairing; retry the removal, or reset the accessory before pairing it again",
                     alias,
                     exc_info=True,
                 )
                 raise
             finally:
-                await pairing.shutdown()
+                # Only once the accessory has actually let go. Shutting down a
+                # pairing we have just restored would hand the caller an object
+                # that refuses to connect, which is the same dead end as not
+                # restoring it at all.
+                if removed:
+                    await pairing.shutdown()
         finally:
             # Outer finally block to ensure that the pairing is removed
             # from the controller even if the shutdown fails.

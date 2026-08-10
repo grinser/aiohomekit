@@ -102,6 +102,10 @@ _PAIR_VERIFY_FATAL: tuple[type[BaseException], ...] = (AuthenticationError,)
 # must stay at least as generous as post_bytes' default: an accessory that answers
 # a large database slowly is supported, not broken.
 GATT_PROBE_TIMEOUT = 20.0
+# How many unanswered 0x09 probes before the accessory is taken to lack it.
+# One is ambiguous -- a lost packet looks the same -- and the model gate does
+# not settle it either, since it names a product and not a firmware.
+GATT_UNSUPPORTED_CONFIRMATIONS = 2
 # The walk result is cached, so it favours completeness over speed: a wide iid
 # range, and the database is only assumed to end after a long run of gaps.
 SIGNATURE_WALK_MAX_IID = 300
@@ -410,6 +414,8 @@ class CoAPHomeKitConnection:
     # Never cleared, for the same reason the instance flag never was:
     # re-probing costs a timeout *and* tears the session down.
     _gatt_unsupported_devices: set[tuple[str, str]] = set()
+    # Consecutive unanswered probes per accessory, until one of them latches.
+    _gatt_probe_failures: dict[tuple[str, str], int] = {}
 
     def __init__(self, owner, host, port):
         self.address = f"[{host}]:{port}"
@@ -421,6 +427,8 @@ class CoAPHomeKitConnection:
         self._pairing_data = None
         # Fallback for connections whose owner has no id yet; see _device_id.
         self._gatt_unsupported_here = False
+        # Per-connection tally; see _record_ambiguous_probe_failure.
+        self._gatt_probe_failures_here = 0
         # Serialises pair-verify so a re-verify cannot race connect() and leave
         # one of two sessions unreferenced (and unclosed) on the accessory.
         self._verify_lock = asyncio.Lock()
@@ -859,6 +867,52 @@ class CoAPHomeKitConnection:
         device_id = self._device_id()
         return device_id is not None and device_id in self._gatt_unsupported_devices
 
+    def _record_ambiguous_probe_failure(self) -> None:
+        """Count an unanswered 0x09, and latch only once it has repeated.
+
+        A no-reply says nothing on its own. Requiring
+        GATT_UNSUPPORTED_CONFIRMATIONS of them costs one extra probe on
+        firmware that genuinely lacks 0x09, and saves a firmware that has it
+        from being walked for the life of the process because of one lost
+        packet. A definitive rejection does not come through here: that is
+        capability evidence and latches immediately.
+        """
+        # Counted per connection as well as per accessory. The shared tally is
+        # what carries a verdict across the fresh pairing a removal builds, but
+        # it needs a key, and a connection whose owner has no id yet has none --
+        # counting only there would latch on the first failure, which is the
+        # thing this exists to prevent.
+        self._gatt_probe_failures_here += 1
+        seen = self._gatt_probe_failures_here
+        key = self._device_id()
+        if key is not None:
+            seen = max(seen, self._gatt_probe_failures.get(key, 0) + 1)
+            self._gatt_probe_failures[key] = seen
+        if seen >= GATT_UNSUPPORTED_CONFIRMATIONS:
+            logger.debug("0x09 unanswered %d times; treating it as unsupported", seen)
+            self._gatt_unsupported = True
+        else:
+            logger.debug(
+                "0x09 unanswered (%d of %d); walking this time but still probing next session",
+                seen,
+                GATT_UNSUPPORTED_CONFIRMATIONS,
+            )
+
+    def forget_gatt_verdict(self) -> None:
+        """Drop what we believe about 0x09 for this accessory.
+
+        Called when the accessory's configuration number changes. HAP requires
+        that on any change to the attribute database, which is what a firmware
+        update that gains -- or loses -- 0x09 produces. Without this the verdict
+        outlives the firmware it was formed against, for the life of the process.
+        """
+        key = self._device_id()
+        if key is not None:
+            self._gatt_unsupported_devices.discard(key)
+            self._gatt_probe_failures.pop(key, None)
+        self._gatt_unsupported_here = False
+        self._gatt_probe_failures_here = 0
+
     @_gatt_unsupported.setter
     def _gatt_unsupported(self, value: bool) -> None:
         if not value:
@@ -950,15 +1004,19 @@ class CoAPHomeKitConnection:
             logger.debug("0x09 probe failed transiently; rebuilding without it this time")
             session_alive = False
         except _PROBE_FAILURES:
-            # No reply at all is the signature of firmware that drops 0x09.
+            # No reply at all is what firmware that drops 0x09 looks like -- and
+            # also what a congested mesh, a sleeping accessory or a lost packet
+            # look like. It is ambiguous, so one of them is never enough.
+            #
+            # The model gate contains the damage but does not settle the
+            # question: it identifies a product, not a firmware capability, and
+            # a gated model whose firmware does implement 0x09 must not be
+            # condemned to the walk by a single bad exchange. Latch only once
+            # the silence has repeated.
             logger.debug("0x09 not answered; will reconnect and rebuild without it")
             session_alive = False
-            # Only latch where the verdict can be acted on. A timeout is not
-            # proof that an accessory lacks 0x09 -- a congested mesh looks the
-            # same -- so on anything that cannot fall back to a walk, latching
-            # would turn one bad exchange into a permanently unreadable device.
             if self._walk_is_permitted():
-                self._gatt_unsupported = True
+                self._record_ambiguous_probe_failure()
 
         if isinstance(body, (bytes, bytearray)):
             try:
