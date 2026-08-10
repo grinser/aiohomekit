@@ -106,11 +106,19 @@ GATT_PROBE_TIMEOUT = 20.0
 # range, and the database is only assumed to end after a long run of gaps.
 SIGNATURE_WALK_MAX_IID = 300
 SIGNATURE_WALK_MAX_MISSES = 25
-# Models whose firmware is known to drop 0x09, matched against the zeroconf
-# `md` record as a prefix. Deliberately a quirk rather than a capability: see
-# CoAPHomeKitConnection._walk_is_permitted. Not every Eve needs it -- Eve Energy
-# answers 0x09 -- which is why the match is only consulted once 0x09 has failed.
-_WALK_SUPPORTED_MODEL_PREFIX = "Eve"
+# Models observed to drop 0x09, matched against the zeroconf `md` record.
+#
+# Deliberately an explicit list rather than a vendor prefix. "Eve" as a prefix
+# admits real hardware from other vendors -- Everspring and Eversmart both ship
+# HomeKit accessories -- and it would also admit an Eve numbered too sparsely
+# for the walk to enumerate safely. Each entry here is a model whose instance
+# ids have been measured as dense (2..59), so the walk reaches the end of the
+# database rather than guessing at it.
+#
+# Widening this is a one-line change, but it needs a measurement behind it, not
+# a family resemblance. Not every Eve belongs: Eve Energy answers 0x09, which
+# is also why the list is only consulted once 0x09 has already failed.
+_WALK_SUPPORTED_MODELS = ("Eve Room", "Eve Weather", "Eve Flare")
 # First accessory's instance id; bridges increment from here.
 COAP_ACCESSORY_IID = 1
 # Probing a contiguous iid range legitimately misses; not worth a warning.
@@ -704,16 +712,20 @@ class CoAPHomeKitConnection:
                 signatures[iid] = bytes(body)
                 misses = 0
                 continue
-            if body not in _WALK_SKIPPABLE_STATUSES and body not in _WALK_EXPECTED_STATUSES:
+            if body in _WALK_SKIPPABLE_STATUSES:
+                # Access-controlled, which means the characteristic EXISTS: we
+                # simply may not read its signature. That is evidence the
+                # database continues, so it resets the run rather than counting
+                # towards it. Counting it terminates the walk on a stretch of
+                # protected characteristics and reports the truncated result as
+                # complete -- the exact defect the fallback is being fixed for.
+                misses = 0
+                continue
+            if body not in _WALK_EXPECTED_STATUSES:
                 # Not a gap -- the accessory is busy or the session is desynced.
                 # Counting it would end the walk mid-database and cache the result
                 # as if it were the whole accessory.
                 raise AccessoryDisconnectedError(f"Signature walk failed at iid {iid} with {body!r}")
-            # Both a gap and an access-controlled characteristic count towards
-            # the miss run, and both fall through to the same stop check below.
-            # A skippable status used to `continue` past that check, so a device
-            # whose characteristics are mostly access-controlled ran to the scan
-            # limit rather than stopping on the miss counter.
             misses += 1
             if misses >= SIGNATURE_WALK_MAX_MISSES:
                 logger.debug(
@@ -904,7 +916,11 @@ class CoAPHomeKitConnection:
         """
         description = getattr(self.owner, "description", None)
         model = getattr(description, "model", None) if description is not None else None
-        return bool(model) and model.startswith(_WALK_SUPPORTED_MODEL_PREFIX)
+        if not model:
+            return False
+        return any(
+            model == supported or model.startswith(f"{supported} ") for supported in _WALK_SUPPORTED_MODELS
+        )
 
     async def _probe_gatt_database(self, verify_attempts: int = 1) -> Pdu09Database | None:
         """Try the 0x09 bulk read; return the database, or None to walk instead.

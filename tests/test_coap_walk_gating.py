@@ -39,7 +39,21 @@ from aiohomekit.exceptions import AccessoryDisconnectedError
 
 from .coap_eve_harness import EVE_LAYOUT, FakeEve, build_connection
 
-NON_EVE_MODELS = ["Nanoleaf Light Strip", "Schlage Encode Plus", "WeMo Stage", "Eeve Fake"]
+# Near-misses matter more than obvious non-matches. Everspring and Eversmart
+# are real HomeKit vendors, and a bare "Eve" or an unmeasured Eve model must not
+# be admitted either -- a prefix match let all of these through.
+NON_EVE_MODELS = [
+    "Nanoleaf Light Strip",
+    "Schlage Encode Plus",
+    "WeMo Stage",
+    "Everspring Door Sensor",
+    "Eversmart Hub",
+    "EveryWare Thing",
+    "Evecolor Bulb",
+    "Eve",
+    "EveRoom",
+    "Eve Energy 20EAO8701",
+]
 
 
 def _walk_would_truncate(blob: bytes, max_misses: int = 25) -> tuple[int, int]:

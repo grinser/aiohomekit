@@ -16,6 +16,7 @@ import struct
 
 import pytest
 from aiocoap.error import NetworkError as AiocoapNetworkError
+from aiocoap.numbers.codes import Code
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from aiohomekit.controller.ble.structs import Characteristic as CharacteristicTLV
@@ -816,3 +817,19 @@ async def test_a_context_shut_down_mid_request_reads_as_a_disconnect():
 
     assert ctx.coap_ctx is None, "the dead context must not be left in place"
     assert coap_ctx.shutdowns == 0, "an already shut-down context must not be shut down again"
+
+
+async def test_an_event_arriving_after_teardown_is_dropped_not_crashed():
+    """reconnect_soon clears enc_ctx without any lock, and events arrive
+    unsolicited, so one can land on a torn-down session. render_put used to
+    dereference enc_ctx three times with no guard.
+    """
+    conn = connection_module.CoAPHomeKitConnection(
+        type("Owner", (), {"event_received": lambda *a: None})(), "::1", 5683
+    )
+    conn.enc_ctx = None
+    resource = connection_module.EventResource(conn)
+
+    reply = await resource.render_put(type("Req", (), {"payload": b"\x00" * 16})())
+
+    assert reply.code == Code.NOT_FOUND

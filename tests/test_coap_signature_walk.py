@@ -130,33 +130,44 @@ def test_repeated_characteristics_in_one_accessory_information_service_do_not_sp
     assert _char_iids(db.accessories[0]) == [2, 3, 4, 5]
 
 
-async def test_access_controlled_characteristics_still_end_the_walk():
-    """A run of access-controlled characteristics counts as a gap run.
+async def test_access_controlled_characteristics_do_not_truncate_the_walk():
+    """An access-controlled characteristic EXISTS -- we just may not read its
+    signature. Counting it towards the gap run terminates the walk on a stretch
+    of protected characteristics and reports the truncated result as complete,
+    which is the defect this whole fallback is being fixed for.
 
-    They used to increment the miss counter and then `continue` past the stop
-    check, so an accessory whose characteristics are mostly protected ran to
-    the full scan limit -- 300 sequential requests on battery -- instead of
-    stopping once it had clearly reached the end of what it can read.
+    A first attempt at trimming the walk's cost did exactly that. The cost was
+    real, but losing characteristics to buy it is the wrong trade.
     """
-    from aiohomekit.controller.coap.connection import SIGNATURE_WALK_MAX_MISSES
     from aiohomekit.controller.coap.pdu import PDUStatus
 
-    from .coap_eve_harness import FakeEve, build_connection
+    from .coap_eve_harness import FakeEve, build_connection, signature
 
-    class AllProtected(FakeEve):
+    ACCESSORY_INFORMATION, MISC = 0x3E, 0x96
+    layout = {
+        2: signature(0x14, ACCESSORY_INFORMATION, 1),
+        3: signature(0x20, ACCESSORY_INFORMATION, 1),
+        5: signature(0x23, ACCESSORY_INFORMATION, 1),
+        # Beyond a run of 35 protected iids, so a walk that counts them as gaps
+        # stops before ever seeing these.
+        41: signature(0x10, MISC, 40),
+        42: signature(0x11, MISC, 40),
+    }
+
+    class MostlyProtected(FakeEve):
         async def post(self, opcode, iid, data, timeout=16.0, expected_statuses=()):
             self.requests.append((opcode, iid))
             if iid in self.layout:
                 return (len(self.layout[iid]), self.layout[iid])
-            return (0, PDUStatus.INSUFFICIENT_AUTHENTICATION)
+            if 6 <= iid <= 40:
+                return (0, PDUStatus.INSUFFICIENT_AUTHENTICATION)
+            return (0, PDUStatus.INVALID_INSTANCE_ID)
 
-    eve = AllProtected()
-    conn = build_connection(eve)
+    conn = build_connection(MostlyProtected(layout=layout))
 
     signatures, complete = await conn._signature_walk()
 
-    assert complete, "the walk must terminate on the miss counter"
-    highest = max(signatures)
-    assert eve.requests[-1][1] <= highest + SIGNATURE_WALK_MAX_MISSES, (
-        f"walked to iid {eve.requests[-1][1]} when the last signature was at {highest}"
+    assert sorted(signatures) == sorted(layout), (
+        f"the walk lost {sorted(set(layout) - set(signatures))} to a run of access-controlled characteristics"
     )
+    assert complete

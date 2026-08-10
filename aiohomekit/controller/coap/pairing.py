@@ -222,18 +222,24 @@ class CoAPPairing(ZeroconfPairing):
             # restores entities from it and the first description update
             # re-reads for real.
             config_num = self.description.config_num if self.description else max(self.config_num, 0)
-            self._accessories_state = AccessoriesState(Accessories.from_list(accessories), config_num)
+            # Captured before the assignment below: AccessoriesState defaults
+            # both to None, so replacing the state first and reading them after
+            # would persist the defaults rather than what we hold.
+            broadcast_key, state_num = self.broadcast_key, self.state_num
+            self._accessories_state = AccessoriesState(
+                Accessories.from_list(accessories), config_num, broadcast_key, state_num
+            )
             logger.debug("%s: caching the signature-walk database as always-stale", self.name)
-            # Only the config number is the sentinel. The broadcast key and
-            # state number are carried through unchanged: passing None cleared
-            # a stored state number, which is what a later catch-up poll checks
-            # against to decide whether it missed anything.
+            # Only the config number is the sentinel. The broadcast key and state
+            # number carry through: passing None cleared a stored state number,
+            # which is what a later catch-up poll compares against to decide
+            # whether it missed anything.
             self.controller._char_cache.async_create_or_update_map(
                 self.id,
                 -1,
                 self.accessories.serialize(),
-                serialize_broadcast_key(self.broadcast_key),
-                self.state_num,
+                serialize_broadcast_key(broadcast_key),
+                state_num,
             )
         else:
             # max(..., 0): with no prior state config_num reports -1, which is

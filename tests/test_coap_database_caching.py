@@ -162,3 +162,30 @@ async def test_a_config_change_with_a_bulk_read_persists_normally():
     assert _persisted(pairing) == [2, 7], "the re-read, then the config-changed save"
     assert pairing._accessories_state.config_num == 7
     assert heard == [7]
+
+
+async def test_the_walk_cache_write_preserves_the_broadcast_key_and_state_number():
+    """Only the config number is the always-stale sentinel.
+
+    Passing None for the other two cleared a stored state number, which is what
+    a later catch-up poll compares against to decide whether it missed events.
+    """
+    from aiohomekit.model import AccessoriesState
+
+    from .coap_eve_harness import FakeEve, build_pairing
+
+    pairing = build_pairing(FakeEve(gatt="dropped"), session=True)
+    # Both live on _accessories_state, not on the description, and both default
+    # to None -- so a test that does not seed them asserts None == None and
+    # passes whatever the code does.
+    pairing._accessories_state = AccessoriesState(pairing.accessories, pairing.config_num, b"\x01" * 32, 7)
+    assert pairing.state_num is not None and pairing.broadcast_key is not None
+
+    await pairing.list_accessories_and_characteristics()
+
+    writes = pairing.controller._char_cache.calls
+    assert writes, "the walk-built database must be cached"
+    last = writes[-1]
+    assert last["config_num"] == -1, "the walk's result is always stale by design"
+    assert last["state_num"] == 7, f"state number was clobbered: stored {last['state_num']!r}"
+    assert last["broadcast_key"] is not None, "broadcast key was clobbered"

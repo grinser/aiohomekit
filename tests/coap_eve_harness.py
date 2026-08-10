@@ -349,13 +349,29 @@ PAIRING_DATA = {
 class FakeCharCache:
     def __init__(self):
         self.saved: list[tuple[str, int]] = []
+        # Every argument, not just the two that were interesting first. Swallowing
+        # the rest as *a made a real defect invisible: the walk's cache write
+        # passed None for the broadcast key and state number, clearing both, and
+        # no test could see it.
+        self.calls: list[dict] = []
         self.map = None
 
     def get_map(self, pairing_id):
         return self.map
 
-    def async_create_or_update_map(self, pairing_id, config_num, accessories, *a, **kw):
+    def async_create_or_update_map(
+        self, pairing_id, config_num, accessories, broadcast_key=None, state_num=None
+    ):
         self.saved.append((pairing_id, config_num))
+        self.calls.append(
+            {
+                "pairing_id": pairing_id,
+                "config_num": config_num,
+                "accessories": accessories,
+                "broadcast_key": broadcast_key,
+                "state_num": state_num,
+            }
+        )
 
 
 class FakeController:
