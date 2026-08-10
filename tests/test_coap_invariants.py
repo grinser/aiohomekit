@@ -780,3 +780,39 @@ async def test_a_dropped_session_leaves_no_usable_context_behind():
 # list here. (That earlier failure is its own pre-existing problem -- it makes
 # load_pairing raise TypeError, which a controller's removal path does not
 # catch -- but it is not this transport's to fix.)
+
+
+async def test_a_context_shut_down_mid_request_reads_as_a_disconnect():
+    """reconnect_soon shuts the context down without taking this lock, so it can
+    land on a request that already passed the coap_ctx check. aiocoap signals
+    that with LibraryShutdown, which is an Error but NOT a NetworkError -- so it
+    escaped the handler and surfaced as a raw aiocoap exception no controller
+    catches. Shutting down again here would also fail: it is already shut down.
+    """
+    from aiocoap.error import LibraryShutdown
+
+    key = ChaCha20Poly1305(b"\x00" * 32)
+
+    class ShutDownUnderUs:
+        def __init__(self):
+            self.shutdowns = 0
+
+        def request(self, message):
+            class _Pending:
+                @property
+                async def response(self):
+                    raise LibraryShutdown()
+
+            return _Pending()
+
+        async def shutdown(self):
+            self.shutdowns += 1
+
+    coap_ctx = ShutDownUnderUs()
+    ctx = connection_module.EncryptionContext(key, key, key, "coap://[::1]/", coap_ctx=coap_ctx)
+
+    with pytest.raises(AccessoryDisconnectedError):
+        await ctx.post_bytes(b"\x00\x01\x02")
+
+    assert ctx.coap_ctx is None, "the dead context must not be left in place"
+    assert coap_ctx.shutdowns == 0, "an already shut-down context must not be shut down again"

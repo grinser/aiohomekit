@@ -26,7 +26,7 @@ from aiohomekit.exceptions import AccessoryDisconnectedError
 from aiohomekit.model import Accessories, AccessoriesState, Transport
 from aiohomekit.model.characteristics import CharacteristicPermissions
 from aiohomekit.protocol.statuscodes import HapStatusCode
-from aiohomekit.utils import async_create_task
+from aiohomekit.utils import async_create_task, serialize_broadcast_key
 from aiohomekit.uuid import normalize_uuid
 from aiohomekit.zeroconf import HomeKitService, ZeroconfPairing
 
@@ -224,8 +224,16 @@ class CoAPPairing(ZeroconfPairing):
             config_num = self.description.config_num if self.description else max(self.config_num, 0)
             self._accessories_state = AccessoriesState(Accessories.from_list(accessories), config_num)
             logger.debug("%s: caching the signature-walk database as always-stale", self.name)
+            # Only the config number is the sentinel. The broadcast key and
+            # state number are carried through unchanged: passing None cleared
+            # a stored state number, which is what a later catch-up poll checks
+            # against to decide whether it missed anything.
             self.controller._char_cache.async_create_or_update_map(
-                self.id, -1, self.accessories.serialize(), None, None
+                self.id,
+                -1,
+                self.accessories.serialize(),
+                serialize_broadcast_key(self.broadcast_key),
+                self.state_num,
             )
         else:
             # max(..., 0): with no prior state config_num reports -1, which is

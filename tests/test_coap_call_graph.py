@@ -2,30 +2,31 @@
 
 Every entry point below was read out of Home Assistant's homekit_controller
 rather than assumed, because the expensive mistakes in this area have all been
-wrong guesses about the caller rather than wrong protocol code. The call sites
-(homeassistant/components/homekit_controller):
+wrong guesses about the caller rather than wrong protocol code. Line numbers are
+deliberately omitted: they belong to another repository and would rot here.
+The call sites (homeassistant/components/homekit_controller):
 
-  pairing      config_flow.py:486  discovery.async_start_pairing(hkid)
-               config_flow.py:441  finish_pairing(code)          -> CoAPPairing
-               config_flow.py:582  pairing.get_primary_name()
-               config_flow.py:584  pairing.close()
-               config_flow.py:589  pairing.accessories_state     -> persisted by HA
-  setup        connection.py:102   controller.load_pairing(unique_id, data)
-               connection.py:318   async_populate_accessories_state(
+  pairing      config_flow.py  discovery.async_start_pairing(hkid)
+               config_flow.py  finish_pairing(code)          -> CoAPPairing
+               config_flow.py  pairing.get_primary_name()
+               config_flow.py  pairing.close()
+               config_flow.py  pairing.accessories_state     -> persisted by HA
+  setup        connection.py   controller.load_pairing(unique_id, data)
+               connection.py   async_populate_accessories_state(
                                        force_update=True, attempts=None|1)
-  removal      __init__.py:111     controller.load_pairing(hkid, dict(entry.data))
-               __init__.py:113     controller.remove_pairing(hkid)
-  stale entry  config_flow.py:281  pairing.list_accessories_and_characteristics()
+  removal      __init__.py     controller.load_pairing(hkid, dict(entry.data))
+               __init__.py     controller.remove_pairing(hkid)
+  stale entry  config_flow.py  pairing.list_accessories_and_characteristics()
 
 Facts that follow from that, which these tests pin down:
 
 * `finish_pairing` builds the pairing itself, so anything it does not pass is
-  absent. `AbstractPairing.description` defaults to None (abstract.py:70) and
+  absent. `AbstractPairing.description` defaults to None (abstract.py) and
   `AbstractPairing.__init__` never assigns it, so a description handed to the
-  constructor survives -- which is how BlePairing does it (ble/pairing.py:256).
+  constructor survives -- which is how BlePairing does it (ble/pairing.py).
 * The description cannot be delivered with `_async_description_update` at
   pairing time: it schedules `_process_config_changed` whenever the advertised
-  config number exceeds ours (abstract.py:175), and ours is -1, so the pairing
+  config number exceeds ours (abstract.py), and ours is -1, so the pairing
   dialog would enumerate after all.
 * HA never calls `list_pairings`, so only `remove_pairing` matters for the
   Pairings characteristic lookup in practice.

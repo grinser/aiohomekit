@@ -128,3 +128,35 @@ def test_repeated_characteristics_in_one_accessory_information_service_do_not_sp
     db = _conn()._database_from_signatures(sigs)
     assert len(db.accessories) == 1
     assert _char_iids(db.accessories[0]) == [2, 3, 4, 5]
+
+
+async def test_access_controlled_characteristics_still_end_the_walk():
+    """A run of access-controlled characteristics counts as a gap run.
+
+    They used to increment the miss counter and then `continue` past the stop
+    check, so an accessory whose characteristics are mostly protected ran to
+    the full scan limit -- 300 sequential requests on battery -- instead of
+    stopping once it had clearly reached the end of what it can read.
+    """
+    from aiohomekit.controller.coap.connection import SIGNATURE_WALK_MAX_MISSES
+    from aiohomekit.controller.coap.pdu import PDUStatus
+
+    from .coap_eve_harness import FakeEve, build_connection
+
+    class AllProtected(FakeEve):
+        async def post(self, opcode, iid, data, timeout=16.0, expected_statuses=()):
+            self.requests.append((opcode, iid))
+            if iid in self.layout:
+                return (len(self.layout[iid]), self.layout[iid])
+            return (0, PDUStatus.INSUFFICIENT_AUTHENTICATION)
+
+    eve = AllProtected()
+    conn = build_connection(eve)
+
+    signatures, complete = await conn._signature_walk()
+
+    assert complete, "the walk must terminate on the miss counter"
+    highest = max(signatures)
+    assert eve.requests[-1][1] <= highest + SIGNATURE_WALK_MAX_MISSES, (
+        f"walked to iid {eve.requests[-1][1]} when the last signature was at {highest}"
+    )

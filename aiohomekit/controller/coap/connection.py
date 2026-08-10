@@ -26,7 +26,7 @@ from typing import Any
 
 from aiocoap import Context, Message, resource
 from aiocoap.error import Error as AiocoapError
-from aiocoap.error import NetworkError
+from aiocoap.error import LibraryShutdown, NetworkError
 from aiocoap.numbers.codes import Code
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -281,6 +281,16 @@ class EncryptionContext:
                 request = Message(code=Code.POST, payload=payload, uri=self.uri)
                 async with asyncio_timeout(timeout):
                     response = await coap_ctx.request(request).response
+            except LibraryShutdown as exc:
+                # The context was shut down while this request was in flight.
+                # The check above cannot prevent it: teardown takes no lock, so
+                # it can land on any request that has already got past it.
+                # Nothing to close here -- it is already closed -- and this is
+                # not a NetworkError, so without this branch it escaped as an
+                # aiocoap exception no controller catches.
+                logger.debug("%s: session torn down while a request was in flight.", self.uri)
+                self.coap_ctx = None
+                raise AccessoryDisconnectedError("Session closed") from exc
             except (NetworkError, asyncio.TimeoutError):
                 logger.debug("%s: Did not receive a reply; end of session.", self.uri)
                 await coap_ctx.shutdown()
@@ -694,16 +704,16 @@ class CoAPHomeKitConnection:
                 signatures[iid] = bytes(body)
                 misses = 0
                 continue
-            if body in _WALK_SKIPPABLE_STATUSES:
-                # A property of this characteristic, not of the session: skip it
-                # rather than discarding every signature collected so far.
-                misses += 1
-                continue
-            if body not in _WALK_EXPECTED_STATUSES:
+            if body not in _WALK_SKIPPABLE_STATUSES and body not in _WALK_EXPECTED_STATUSES:
                 # Not a gap -- the accessory is busy or the session is desynced.
                 # Counting it would end the walk mid-database and cache the result
                 # as if it were the whole accessory.
                 raise AccessoryDisconnectedError(f"Signature walk failed at iid {iid} with {body!r}")
+            # Both a gap and an access-controlled characteristic count towards
+            # the miss run, and both fall through to the same stop check below.
+            # A skippable status used to `continue` past that check, so a device
+            # whose characteristics are mostly access-controlled ran to the scan
+            # limit rather than stopping on the miss counter.
             misses += 1
             if misses >= SIGNATURE_WALK_MAX_MISSES:
                 logger.debug(
