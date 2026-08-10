@@ -215,11 +215,45 @@ async def test_an_m1_rejected_for_authentication_raises_authentication_error():
         "truncated-tlv",
     ],
 )
-async def test_an_unreadable_m2_is_reported_as_success(kwargs):
-    """M1 was accepted, so the removal stands. Raising would regress the caller:
-    aiohomekit keeps the local pairing record when this raises, leaving a record
-    for a pairing the accessory has already dropped."""
+async def test_an_unconfirmed_m2_is_never_reported_as_success(kwargs):
+    """Only a well-formed M2 confirms a removal.
+
+    "M1 was accepted" proves nothing: measured on an Eve Room, writing M1 and
+    closing without reading M2 returns Success and leaves the pairing in place.
+    That is the failure in issue #164, and reporting success on an unreadable
+    M2 reproduces it exactly -- the controller discards its own credentials
+    while the accessory stays paired, needing a factory reset.
+
+    The same measurement showed M2 does arrive on that firmware, so this path
+    is genuinely exceptional rather than the routine cost of removing our own
+    pairing, which is what it was previously assumed to be.
+    """
     conn = _connection(**kwargs)
 
-    assert await conn.remove_pairing(CONTROLLER_ID) is True
+    with pytest.raises(UnknownError, match="could not be confirmed"):
+        await conn.remove_pairing(CONTROLLER_ID)
+    assert conn.enc_ctx.writes, "M1 must still have been written"
+
+
+@pytest.mark.parametrize(
+    ("body", "case"),
+    [
+        # Valid outer value TLV, inner state says M1 rather than M2. A real M2
+        # from an Eve Room is 01 03 06 01 02; this is that with the state byte
+        # changed, i.e. the accessory answering a different step.
+        (b"\x01\x03\x06\x01\x01", "state-is-m1"),
+        # Decodes, but carries no state at all.
+        (b"\x01\x03\x01\x01\x41", "no-state"),
+    ],
+    ids=["state-is-m1", "no-state"],
+)
+async def test_a_decodable_reply_that_is_not_m2_is_not_confirmation(body, case):
+    """The reply parsed, so none of the unreadable-M2 guards fire. It still is
+    not the response this procedure is waiting for, and treating it as one puts
+    us back to reporting a removal we cannot show happened.
+    """
+    conn = _connection(read_result=body)
+
+    with pytest.raises(UnknownError, match="could not be confirmed"):
+        await conn.remove_pairing(CONTROLLER_ID)
     assert conn.enc_ctx.writes, "M1 must still have been written"

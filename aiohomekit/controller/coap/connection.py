@@ -391,7 +391,7 @@ class CoAPHomeKitConnection:
     #
     # Never cleared, for the same reason the instance flag never was:
     # re-probing costs a timeout *and* tears the session down.
-    _gatt_unsupported_devices: set[str] = set()
+    _gatt_unsupported_devices: set[tuple[str, str]] = set()
 
     def __init__(self, owner, host, port):
         self.address = f"[{host}]:{port}"
@@ -850,15 +850,30 @@ class CoAPHomeKitConnection:
         if device_id is not None:
             self._gatt_unsupported_devices.add(device_id)
 
-    def _device_id(self) -> str | None:
-        """The accessory's pairing id, or None if it is not knowable yet.
+    def _device_id(self) -> tuple[str, str] | None:
+        """The key the 0x09 verdict is remembered under, or None if unknowable.
+
+        Deliberately (accessory pairing id, *our* pairing id) rather than the
+        accessory alone. The accessory's id survives an unpair -- measured: an
+        Eve Room kept F2:41:26:0F:C7:2F across a remove and re-pair -- so keying
+        on it alone would carry a verdict across a re-pairing, and across a
+        firmware update installed in between. Our own pairing id is regenerated
+        by pair-setup, so a genuine re-pair produces a new key and probes again.
+
+        What it must NOT do is change when a controller builds a fresh pairing
+        object for the same credentials, which is exactly what happens on the
+        removal path. It does not: the credentials, and so this id, are copied.
 
         CoAPPairing assigns self.connection before calling super().__init__,
         which is what sets self.id -- so during construction the owner exists
         but has no id. Absent rather than exceptional, hence the default.
         """
         owner = self.owner
-        return getattr(owner, "id", None) if owner is not None else None
+        accessory_id = getattr(owner, "id", None) if owner is not None else None
+        if accessory_id is None:
+            return None
+        pairing_data = self._pairing_data or {}
+        return (accessory_id, pairing_data.get("iOSPairingId") or "")
 
     def _walk_is_permitted(self) -> bool:
         """May this accessory be enumerated by signature walk?
@@ -1433,11 +1448,13 @@ class CoAPHomeKitConnection:
         # the response is collected, so writing alone leaves the pairing in
         # place while telling the caller it succeeded.
         #
-        # An unreadable M2 is not a failure: removing our own pairing ends the
-        # session, so the response legitimately may never arrive. M1 was
-        # accepted, so the removal stands -- raising here would make the caller
-        # keep a local record for a pairing the accessory has already dropped,
-        # which is why the broad except below is deliberate.
+        # Only a well-formed M2 confirms the removal. Reporting success without
+        # one is the failure this whole procedure exists to prevent: measured on
+        # an Eve Room, writing M1 and closing without reading M2 returns Success
+        # and leaves the pairing in place, so "M1 was accepted" is not evidence
+        # of anything. The same measurement showed M2 does come back on that
+        # firmware, so an unreadable one is genuinely exceptional rather than
+        # the routine consequence of removing our own pairing.
         try:
             async with asyncio_timeout(REMOVE_PAIRING_M2_TIMEOUT):
                 _, result = await self._session.post(
@@ -1446,28 +1463,24 @@ class CoAPHomeKitConnection:
                     b"",
                 )
         except Exception as exc:
-            logger.debug("Remove pairing M2 not read (%r); the removal itself was accepted", exc)
-            return True
+            raise UnknownError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                f"was not readable ({exc!r}). The accessory may still be paired."
+            ) from exc
 
         if isinstance(result, PDUStatus) or not result:
-            logger.debug("Remove pairing M2 not readable (%s); the removal itself was accepted", result)
-            return True
+            raise UnknownError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                f"came back as {result!r}. The accessory may still be paired."
+            )
 
         try:
             m2 = decode_list_pairings_response(result)
         except Exception as exc:
-            # Distinct from the cases above: the accessory answered with a
-            # non-empty body that is not a pairing response. The removal still
-            # stands -- M1 was accepted at a characteristic confirmed to be the
-            # Pairings one just beforehand, which is what makes this leniency
-            # defensible -- but the reply is not what this procedure expects, so
-            # it is worth seeing rather than debug-only.
-            logger.warning(
-                "Remove pairing M2 was answered but could not be decoded (%r); "
-                "treating the removal as accepted because M1 was",
-                exc,
-            )
-            return True
+            raise UnknownError(
+                "Remove pairing could not be confirmed: M2 was answered but "
+                f"could not be decoded ({exc!r}). The accessory may still be paired."
+            ) from exc
 
         # The accessory did answer: an explicit error in M2 is a real failure.
         m2_error = [entry for entry in m2 if entry[0] == TLV.kTLVType_Error]
@@ -1479,6 +1492,9 @@ class CoAPHomeKitConnection:
 
         m2_state = [entry for entry in m2 if entry[0] == TLV.kTLVType_State]
         if len(m2_state) != 1 or m2_state[0][1] != TLV.M2:
-            logger.debug("Unexpected state in remove pairing M2: %r", m2_state)
+            raise UnknownError(
+                "Remove pairing could not be confirmed: expected M2, got "
+                f"{m2_state!r}. The accessory may still be paired."
+            )
 
         return True
