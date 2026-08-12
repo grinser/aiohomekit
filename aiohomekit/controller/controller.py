@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
-from asyncio.log import logger
 from collections.abc import AsyncIterable
 from contextlib import AsyncExitStack
 
@@ -42,6 +42,9 @@ from ..exceptions import (
     TransportNotSupportedError,
 )
 from .abstract import AbstractController, AbstractPairing, TransportType
+
+
+logger = logging.getLogger(__name__)
 
 
 class Controller(AbstractController):
@@ -204,8 +207,9 @@ class Controller(AbstractController):
 
     async def remove_pairing(self, alias: str) -> None:
         """
-        Remove a pairing between the controller and the accessory. The pairing data is delete on both ends, on the
-        accessory and the controller.
+        Remove a pairing between the controller and the accessory. On success the pairing data is deleted on both
+        ends, on the accessory and the controller. On any failure the pairing is kept on the controller side, so the
+        removal can be retried; the accessory may or may not still hold it.
 
         Important: no automatic saving of the pairing data is performed. If you don't do this, the accessory seems still
             to be paired on the next start of the application.
@@ -213,12 +217,14 @@ class Controller(AbstractController):
         :param alias: the controller's alias for the accessory
         :raises AuthenticationError: if the controller isn't authenticated to the accessory.
         :raises AccessoryNotFoundError: if the device can not be found via zeroconf
+        :raises AccessoryDisconnectedError: if the removal could not be confirmed; the accessory may still be paired
         :raises UnknownError: on unknown errors
         """
         if alias not in self.aliases:
             raise AccessoryNotFoundError(f'Alias "{alias}" is not found.')
 
         pairing = self.aliases[alias]
+        removed = False
 
         try:
             try:
@@ -234,9 +240,27 @@ class Controller(AbstractController):
                 primary_pairing_id = pairing.pairing_data["iOSPairingId"]
 
                 await pairing.remove_pairing(primary_pairing_id)
+                removed = True
+            except BaseException:
+                # the accessory still holds the pairing, so keep ours for a retry
+                # BaseException on purpose: a cancelled removal must not lose it either
+                self.aliases[alias] = pairing
+                pairing.controller.aliases[alias] = pairing
+                self.pairings[pairing.id] = pairing
+                pairing.controller.pairings[pairing.id] = pairing
+                logger.warning(
+                    "%s: the pairing was NOT removed from the accessory. It still holds the "
+                    "pairing; retry the removal, or reset the accessory before pairing it again",
+                    alias,
+                )
+                raise
             finally:
-                await pairing.shutdown()
+                # only shut down a pairing the accessory has actually let go of
+                if removed:
+                    await pairing.shutdown()
         finally:
             # Outer finally block to ensure that the pairing is removed
             # from the controller even if the shutdown fails.
-            self._char_cache.async_delete_map(pairing.id)
+            # keep the cached map on failure, it holds the Pairings iid a retry needs
+            if removed:
+                self._char_cache.async_delete_map(pairing.id)
