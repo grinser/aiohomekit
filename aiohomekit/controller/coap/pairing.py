@@ -106,8 +106,13 @@ class CoAPPairing(ZeroconfPairing):
             # await the connection outside of the lock
             # this allows other coroutines to show up & wait
             await self.connection_future
-        except BaseException:
-            raise AccessoryDisconnectedError("failed to connect")
+        except asyncio.CancelledError:
+            raise
+        except AccessoryDisconnectedError:
+            # already the right type; re-wrapping would flatten a subclass
+            raise
+        except BaseException as exc:
+            raise AccessoryDisconnectedError("failed to connect") from exc
         else:
             # in case this was a reconnect, re-subscribe
             if len(self.subscriptions):

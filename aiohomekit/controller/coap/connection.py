@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from aiohomekit.exceptions import (
     AccessoryDisconnectedError,
+    AccessoryEnumerationError,
     AuthenticationError,
     EncryptionError,
     InvalidError,
@@ -406,7 +407,11 @@ class CoAPHomeKitConnection:
             if enumerate_database:
                 # we need the info this provides to be able to read/write characteristics
                 # pairing operations skip it, they resolve the one iid they need themselves
-                await self.get_accessory_info()
+                try:
+                    await self.get_accessory_info()
+                except AccessoryDisconnectedError as exc:
+                    # pair verify succeeded, so it is specifically the database read that failed
+                    raise AccessoryEnumerationError(str(exc)) from exc
 
             return
 
