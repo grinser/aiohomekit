@@ -34,6 +34,7 @@ from aiohomekit.exceptions import (
     AccessoryDisconnectedError,
     AuthenticationError,
     EncryptionError,
+    InvalidError,
     UnknownError,
 )
 from aiohomekit.model.characteristics import (
@@ -67,6 +68,9 @@ COAP_AID = 1
 # short type ids, as a Pdu09Database reports them
 _PAIRING_SERVICE = 0x55
 _PAIRINGS_CHARACTERISTIC = 0x50
+
+# removing our own pairing may end the session before M2 is answered
+REMOVE_PAIRING_M2_TIMEOUT = 4.0
 
 
 def decode_pdu_03(buf):
@@ -187,10 +191,12 @@ class EncryptionContext:
 
             return await self._decrypt_response(response)
 
-    async def post(self, opcode: OpCode, iid: int, data: bytes) -> tuple[int, bytes | PDUStatus]:
+    async def post(
+        self, opcode: OpCode, iid: int, data: bytes, timeout: float = 16.0
+    ) -> tuple[int, bytes | PDUStatus]:
         tid = random.randint(1, 254)
         req_pdu = encode_pdu(opcode, tid, iid, data)
-        res_pdu = await self.post_bytes(req_pdu)
+        res_pdu = await self.post_bytes(req_pdu, timeout)
         return decode_pdu(tid, res_pdu)
 
     async def post_all(self, opcode: OpCode, iids: list[int], data: list[bytes]) -> list[bytes | PDUStatus]:
@@ -739,7 +745,6 @@ class CoAPHomeKitConnection:
             payload,
         )
 
-        # iOS didn't retrieve M2 from the pairings characteristic
         if isinstance(result, PDUStatus):
             if result in [
                 PDUStatus.INSUFFICIENT_AUTHENTICATION,
@@ -747,5 +752,53 @@ class CoAPHomeKitConnection:
             ]:
                 raise AuthenticationError("Remove pairing failed")
             raise UnknownError("Remove pairing failed")
+
+        # the procedure is not complete until M2 is read back: some accessories
+        # (Eve over Thread) do not apply the removal until then, and an M2 we
+        # cannot read leaves the removal unconfirmed rather than failed
+        # the timeout goes through post() so an unanswered read ends the session
+        try:
+            _, result = await self.enc_ctx.post(
+                OpCode.CHAR_READ,
+                pairings_iid,
+                b"",
+                timeout=REMOVE_PAIRING_M2_TIMEOUT,
+            )
+        except Exception as exc:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                f"was not readable ({exc!r}). The accessory may still be paired."
+            ) from exc
+
+        if isinstance(result, PDUStatus):
+            if result in [
+                PDUStatus.INSUFFICIENT_AUTHENTICATION,
+                PDUStatus.INSUFFICIENT_AUTHORIZATION,
+            ]:
+                raise AuthenticationError("Remove pairing failed")
+            raise UnknownError(f"Remove pairing failed: M2 read rejected with {result!r}")
+
+        if not result:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                "came back empty. The accessory may still be paired."
+            )
+
+        try:
+            m2 = dict(decode_list_pairings_response(result))
+        except Exception as exc:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M2 was answered but "
+                f"could not be decoded ({exc!r}). The accessory may still be paired."
+            ) from exc
+
+        # the same checks the BLE and IP transports apply to their M2
+        if m2.get(TLV.kTLVType_State, TLV.M2) != TLV.M2:
+            raise InvalidError("Unexpected state after removing pairing request")
+
+        if TLV.kTLVType_Error in m2:
+            if m2[TLV.kTLVType_Error] == TLV.kTLVError_Authentication:
+                raise AuthenticationError("Remove pairing failed: insufficient access")
+            raise UnknownError("Remove pairing failed: unknown error")
 
         return True

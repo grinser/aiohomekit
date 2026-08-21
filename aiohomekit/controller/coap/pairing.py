@@ -250,6 +250,11 @@ class CoAPPairing(ZeroconfPairing):
     async def remove_pairing(self, pairingId: str) -> bool:
         await self._ensure_connected(enumerate_database=False)
         if await self.connection.remove_pairing(pairingId):
-            await self._shutdown_if_primary_pairing_removed(pairingId)
+            try:
+                await self._shutdown_if_primary_pairing_removed(pairingId)
+            except AccessoryDisconnectedError as exc:
+                # the accessory may drop the session before shutdown's unsubscribe
+                # completes; the removal is already confirmed
+                logger.debug("%s: session ended after the pairing was removed: %s", self.name, exc)
             return True
         return False
