@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import struct
+from collections.abc import Collection
 from enum import Enum
 
 from aiohomekit.enum import EnumWithDescription
@@ -71,7 +72,11 @@ def encode_all_pdus(opcode: OpCode, iids: list[int], data: list[bytes]) -> bytes
     return req_pdu
 
 
-def decode_pdu(expected_tid: int, data: bytes) -> tuple[int, bytes | PDUStatus]:
+def decode_pdu(
+    expected_tid: int,
+    data: bytes,
+    expected_statuses: Collection[PDUStatus] = (),
+) -> tuple[int, bytes | PDUStatus]:
     control, tid, status, body_len = struct.unpack("<BBBH", data[0:5])
     status = PDUStatus(status)
 
@@ -90,7 +95,10 @@ def decode_pdu(expected_tid: int, data: bytes) -> tuple[int, bytes | PDUStatus]:
         return (body_len, PDUStatus.TID_MISMATCH)
 
     if status != PDUStatus.SUCCESS:
-        logger.warning(f"Transaction {tid} failed with error {status} ({status.description}")
+        # Callers that probe a range of instance ids expect a failure for every
+        # gap; at warning that is hundreds of lines for a healthy accessory.
+        log = logger.debug if status in expected_statuses else logger.warning
+        log("Transaction %d failed with error %s (%s)", tid, status, status.description)
         return (body_len, status)
 
     if control & 0b0000_1110 != 0b0000_0010:
