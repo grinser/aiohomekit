@@ -34,8 +34,14 @@ from aiohomekit.exceptions import (
     AccessoryDisconnectedError,
     AuthenticationError,
     EncryptionError,
+    InvalidError,
     UnknownError,
 )
+from aiohomekit.model.characteristics import (
+    CharacteristicPermissions,
+    CharacteristicsTypes,
+)
+from aiohomekit.model.services import ServicesTypes
 from aiohomekit.protocol import (
     get_session_keys,
     perform_pair_setup_part1,
@@ -43,6 +49,7 @@ from aiohomekit.protocol import (
 )
 from aiohomekit.protocol.tlv import HAP_TLV, TLV
 from aiohomekit.utils import asyncio_timeout
+from aiohomekit.uuid import normalize_uuid
 
 from .pdu import (
     OpCode,
@@ -55,6 +62,15 @@ from .pdu import (
 from .structs import Pdu09Database
 
 logger = logging.getLogger(__name__)
+
+# the pairing service lives on the first accessory
+COAP_AID = 1
+# short type ids, as a Pdu09Database reports them
+_PAIRING_SERVICE = 0x55
+_PAIRINGS_CHARACTERISTIC = 0x50
+
+# removing our own pairing may end the session before M2 is answered
+REMOVE_PAIRING_M2_TIMEOUT = 4.0
 
 
 def decode_pdu_03(buf):
@@ -175,10 +191,12 @@ class EncryptionContext:
 
             return await self._decrypt_response(response)
 
-    async def post(self, opcode: OpCode, iid: int, data: bytes) -> tuple[int, bytes | PDUStatus]:
+    async def post(
+        self, opcode: OpCode, iid: int, data: bytes, timeout: float = 16.0
+    ) -> tuple[int, bytes | PDUStatus]:
         tid = random.randint(1, 254)
         req_pdu = encode_pdu(opcode, tid, iid, data)
-        res_pdu = await self.post_bytes(req_pdu)
+        res_pdu = await self.post_bytes(req_pdu, timeout)
         return decode_pdu(tid, res_pdu)
 
     async def post_all(self, opcode: OpCode, iids: list[int], data: list[bytes]) -> list[bytes | PDUStatus]:
@@ -209,7 +227,8 @@ class EventResource(resource.Resource):
             _, iid, body_len = struct.unpack("<BHH", payload[offset : offset + 5])
             body = payload[offset + 5 : offset + 5 + body_len]
 
-            characteristic = self.connection.info.find_characteristic_by_iid(iid)
+            info = self.connection.info
+            characteristic = info.find_characteristic_by_iid(iid) if info else None
             value = decode_pdu_03(body) if body_len > 0 else b""
             if characteristic is not None and body_len > 0:
                 characteristic.raw_value = value
@@ -241,6 +260,8 @@ class CoAPHomeKitConnection:
         self.enc_ctx = None
         self.owner = owner
         self.pair_setup_client = None
+        # set by get_accessory_info, which connect() may skip
+        self.info: Pdu09Database | None = None
 
     async def reconnect_soon(self):
         if not self.enc_ctx:
@@ -367,7 +388,7 @@ class CoAPHomeKitConnection:
 
         return True
 
-    async def connect(self, pairing_data):
+    async def connect(self, pairing_data, enumerate_database: bool = True):
         async with self.connection_lock:
             if self.is_connected:
                 logger.debug("Already connected")
@@ -382,8 +403,10 @@ class CoAPHomeKitConnection:
                 logger.debug("Pair verify failed", exc_info=exc)
                 raise AccessoryDisconnectedError("Pair verify failed")
 
-            # we need the info this provides to be able to read/write characteristics
-            await self.get_accessory_info()
+            if enumerate_database:
+                # we need the info this provides to be able to read/write characteristics
+                # pairing operations skip it, they resolve the one iid they need themselves
+                await self.get_accessory_info()
 
             return
 
@@ -483,10 +506,16 @@ class CoAPHomeKitConnection:
         logger.debug(f"Read characteristics: {results!r}")
         return results
 
+    async def _ensure_enumerated(self) -> None:
+        """Read the database if the session was established without it."""
+        if self.info is None:
+            await self.get_accessory_info()
+
     async def read_characteristics(
         self, characteristics: Iterable[tuple[int, int]]
     ) -> dict[tuple[int, int], dict[str, Any]]:
         """Read characteristics from the accessory."""
+        await self._ensure_enumerated()
         # _read_characteristics_exit expects a list of tuples
         # as it does an ordered read so we need to convert
         # to a list to preserve the order
@@ -543,6 +572,7 @@ class CoAPHomeKitConnection:
         return results
 
     async def write_characteristics(self, ids_values: list[tuple[int, int, Any]]):
+        await self._ensure_enumerated()
         tlv_values = self._write_characteristics_enter(ids_values)
 
         # batch write
@@ -612,8 +642,46 @@ class CoAPHomeKitConnection:
         pdu_results = await self.enc_ctx.post_all(OpCode.UNK_0C_UNSUBSCRIBE, iids, data)
         return self._unsubscribe_from_exit(ids, pdu_results)
 
+    def _cached_pairings_iid(self) -> int | None:
+        """The Pairings characteristic iid from the owner's cached accessories, if any."""
+        # the cache is a model Accessories (iid), not a Pdu09Database (instance_id)
+        accessories = getattr(self.owner, "accessories", None)
+        if not accessories:
+            return None
+        accessory = accessories.aid_or_none(COAP_AID)
+        if accessory is None:
+            return None
+        service = accessory.services.first(service_type=ServicesTypes.PAIRING)
+        if service is None:
+            return None
+        char = service.characteristics_by_type.get(normalize_uuid(CharacteristicsTypes.PAIRING_PAIRINGS))
+        if char is None or CharacteristicPermissions.paired_write not in char.perms:
+            return None
+        return char.iid
+
+    async def _pairings_iid(self) -> int:
+        """Resolve the Pairings characteristic iid, enumerating only when there is no cache."""
+        if (iid := self._cached_pairings_iid()) is not None:
+            return iid
+
+        if self.info is None:
+            await self.get_accessory_info()
+
+        accessory = next(
+            (acc for acc in self.info.accessories if acc.instance_id == COAP_AID),
+            None,
+        )
+        if accessory is None:
+            raise UnknownError(f"No accessory at aid {COAP_AID}")
+        characteristic = accessory.find_service_characteristic_by_type(
+            _PAIRING_SERVICE, _PAIRINGS_CHARACTERISTIC
+        )
+        if characteristic is None:
+            raise UnknownError("Accessory has no Pairings characteristic")
+        return characteristic.instance_id
+
     async def list_pairings(self):
-        pairings_characteristic = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+        pairings_iid = await self._pairings_iid()
 
         # list pairings M1
         m1_payload = TLV.encode_list(
@@ -625,14 +693,14 @@ class CoAPHomeKitConnection:
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
         payload_len, payload = await self.enc_ctx.post(
             OpCode.CHAR_WRITE,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             payload,
         )
         # XXX check response
 
         payload_len, payload = await self.enc_ctx.post(
             OpCode.CHAR_READ,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             b"",
         )
         # XXX check response
@@ -660,7 +728,7 @@ class CoAPHomeKitConnection:
         return list(zip(id_list, pk_list, pr_list))
 
     async def remove_pairing(self, pairing_id) -> bool:
-        pairings_characteristic = self.info.accessories[0].find_service_characteristic_by_type(0x55, 0x50)
+        pairings_iid = await self._pairings_iid()
 
         # remove pairings M1
         m1_payload = TLV.encode_list(
@@ -673,11 +741,10 @@ class CoAPHomeKitConnection:
         payload = TLV.encode_list([(HAP_TLV.kTLVHAPParamValue, m1_payload)])
         result_len, result = await self.enc_ctx.post(
             OpCode.CHAR_WRITE,
-            pairings_characteristic.instance_id,
+            pairings_iid,
             payload,
         )
 
-        # iOS didn't retrieve M2 from the pairings characteristic
         if isinstance(result, PDUStatus):
             if result in [
                 PDUStatus.INSUFFICIENT_AUTHENTICATION,
@@ -685,5 +752,53 @@ class CoAPHomeKitConnection:
             ]:
                 raise AuthenticationError("Remove pairing failed")
             raise UnknownError("Remove pairing failed")
+
+        # the procedure is not complete until M2 is read back: some accessories
+        # (Eve over Thread) do not apply the removal until then, and an M2 we
+        # cannot read leaves the removal unconfirmed rather than failed
+        # the timeout goes through post() so an unanswered read ends the session
+        try:
+            _, result = await self.enc_ctx.post(
+                OpCode.CHAR_READ,
+                pairings_iid,
+                b"",
+                timeout=REMOVE_PAIRING_M2_TIMEOUT,
+            )
+        except Exception as exc:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                f"was not readable ({exc!r}). The accessory may still be paired."
+            ) from exc
+
+        if isinstance(result, PDUStatus):
+            if result in [
+                PDUStatus.INSUFFICIENT_AUTHENTICATION,
+                PDUStatus.INSUFFICIENT_AUTHORIZATION,
+            ]:
+                raise AuthenticationError("Remove pairing failed")
+            raise UnknownError(f"Remove pairing failed: M2 read rejected with {result!r}")
+
+        if not result:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M1 was accepted but M2 "
+                "came back empty. The accessory may still be paired."
+            )
+
+        try:
+            m2 = dict(decode_list_pairings_response(result))
+        except Exception as exc:
+            raise AccessoryDisconnectedError(
+                "Remove pairing could not be confirmed: M2 was answered but "
+                f"could not be decoded ({exc!r}). The accessory may still be paired."
+            ) from exc
+
+        # the same checks the BLE and IP transports apply to their M2
+        if m2.get(TLV.kTLVType_State, TLV.M2) != TLV.M2:
+            raise InvalidError("Unexpected state after removing pairing request")
+
+        if TLV.kTLVType_Error in m2:
+            if m2[TLV.kTLVType_Error] == TLV.kTLVError_Authentication:
+                raise AuthenticationError("Remove pairing failed: insufficient access")
+            raise UnknownError("Remove pairing failed: unknown error")
 
         return True
