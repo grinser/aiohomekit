@@ -187,6 +187,12 @@ class AccessoryDisconnectedError(HomeKitException):
         Exception.__init__(self, message)
 
 
+class AccessoryEnumerationError(AccessoryDisconnectedError):
+    """
+    The accessory database could not be read on a session that otherwise works (pair verify succeeded).
+    """
+
+
 class ConnectionError(AccessoryDisconnectedError):
     """
     Used if a HomeKit disconnects part way through an operation or series of operations.
